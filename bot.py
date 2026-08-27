@@ -34,7 +34,7 @@ ALERT_CHECK_SECONDS = 300
 
 GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-MODEL_CHAIN = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+MODEL_CHAIN = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest"]
 
 GROQ_MODEL_CHAIN = [
     "openai/gpt-oss-120b",
