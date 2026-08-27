@@ -18,7 +18,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TWELVEDATA_KEY = os.getenv("TWELVEDATA_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. Hanumabathini/trading
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. Hanumabathini/trading  (EXACT owner/name!)
 
 # ============ AI BRAINS: Gemini chain + Groq fallback ============
 
@@ -214,11 +214,25 @@ def gh_write_file(new_content, sha):
         body["sha"] = sha
     r = requests.put(url, headers=gh_headers(), json=body, timeout=20)
     if r.status_code not in (200, 201):
-        raise Exception(f"GitHub write failed {r.status_code}: {r.text[:200]}")
+        # DEBUG HELPER: show exactly what repo/token we used
+        token_prefix = GITHUB_TOKEN[:10] + "..." if GITHUB_TOKEN else "MISSING!"
+        print(f"❌ GH write {r.status_code} | repo='{GITHUB_REPO}' | token={token_prefix}")
+        hint = ""
+        if r.status_code == 404:
+            hint = (
+                "\n\n🔍 404 usually means GITHUB_REPO is wrong.\n"
+                "It must be EXACTLY owner/name from the repo URL.\n"
+                f"Bot is currently trying: '{GITHUB_REPO}'"
+            )
+        elif r.status_code == 403:
+            hint = "\n\n🔍 403 = token lacks permission. Needs Contents: Read and write."
+        elif r.status_code == 401:
+            hint = "\n\n🔍 401 = token invalid/expired. Regenerate the PAT."
+        raise Exception(f"GitHub write failed {r.status_code}: {r.text[:150]}{hint}")
 
 
 def add_journal_entry(text):
-    """Append a timestamped note to the journal file. Returns commit message."""
+    """Append a timestamped note to the journal file. Returns stamp line."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     price_line = ""
     try:
@@ -235,7 +249,7 @@ def add_journal_entry(text):
 
 
 def get_recent_entries(n=5):
-    """Extract the last N '## ' entry headers + their lines."""
+    """Extract the last N '## ' entry blocks."""
     _, content = gh_get_file()
     if not content:
         return None
@@ -571,7 +585,7 @@ gh_status = "✅" if (GITHUB_TOKEN and GITHUB_REPO) else "⚠️ journal off"
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
 print(f"🧠 Dual-brain: Gemini(3 models) → Groq chain {brain_status}")
 print(f"📡 Market data: TwelveData → Yahoo {td_status}")
-print(f"📓 Journal → GitHub/{JOURNAL_DIR}: {gh_status}")
+print(f"📓 Journal → GitHub/{JOURNAL_DIR}: {gh_status} (repo: {GITHUB_REPO})")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
