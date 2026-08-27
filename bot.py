@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 import yfinance as yf
 import google.generativeai as genai
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -13,7 +13,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- Gemini setup ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini = genai.GenerativeModel("gemini-3.6-flash")
+gemini = genai.GenerativeModel("gemini-1.5-flash")
 
 # ================= HELPERS =================
 
@@ -84,7 +84,8 @@ async def start(update, context):
         "/price - live price\n"
         "/analyze - AI analysis\n"
         "/webhookstatus - check webhook\n"
-        "/help - commands"
+        "/help - commands\n\n"
+        "💬 Or just chat with me — ask anything about gold!"
     )
 
 async def price(update, context):
@@ -115,16 +116,36 @@ async def analyze(update, context):
 async def webhookstatus(update, context):
     await update.message.reply_text(
         "🔗 Webhook server runs on port 5000.\n"
-        "Cloudflared terminal must stay open with the tunnel.\n"
         "TradingView signals arrive instantly when everything is running!"
     )
 
 async def help_cmd(update, context):
-    await update.message.reply_text("Commands: /start /price /analyze /webhookstatus /help")
+    await update.message.reply_text(
+        "Commands: /start /price /analyze /webhookstatus /help\n\n"
+        "💬 Or type any question normally — I'll answer!"
+    )
+
+# ================= FREE CHAT (any normal text -> Gemini) =================
+
+GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
+You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
+give balanced views, and remind lightly that this is not financial advice."""
+
+async def free_chat(update, context):
+    user_text = update.message.text
+    print(f"💬 Chat received: {user_text}")
+    await update.message.chat.send_action("typing")
+    try:
+        response = gemini.generate_content(f"{GOLD_CONTEXT}\n\nUser: {user_text}")
+        await update.message.reply_text(response.text)
+        print("✅ Reply sent")
+    except Exception as e:
+        await update.message.reply_text(f"😵 Brain glitch: {e}")
 
 # ================= RUN EVERYTHING =================
 
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
+print("💬 Free chat enabled")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -134,4 +155,8 @@ app.add_handler(CommandHandler("price", price))
 app.add_handler(CommandHandler("analyze", analyze))
 app.add_handler(CommandHandler("webhookstatus", webhookstatus))
 app.add_handler(CommandHandler("help", help_cmd))
+
+# Must be LAST so slash commands still work first
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_chat))
+
 app.run_polling()
