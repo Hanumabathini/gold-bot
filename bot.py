@@ -12,9 +12,9 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GROQ_API_KEY = auto = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ================= AI BRAINS: Gemini chain + Groq auto-discovery fallback =================
+# ============ AI BRAINS: Gemini chain + Groq auto-discovery fallback ============
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -22,11 +22,11 @@ MODEL_CHAIN = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-flash-latest"]
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_URL = f"{GROQ_BASE}/chat/completions"
 
-groq_model_cache = None  # discovered once at runtime
+groq_model_cache = None
 
 
 def get_groq_models():
-    """Ask Groq which models this key can actually use - chat models first."""
+    """Ask Groq which models this key can use - normal chat models first."""
     global groq_model_cache
     if groq_model_cache is None:
         try:
@@ -41,17 +41,17 @@ def get_groq_models():
             groq_model_cache = []
             return groq_model_cache
 
-        # Drop obviously non-chat models (audio/tts/guard)
+        # Drop non-chat models (audio/tts/guard)
         all_models = [
             m for m in all_models
             if not any(k in m for k in ("whisper", "tts", "guard"))
         ]
 
-        # Prefer classic fast chat models; push reasoning models last
         def rank(m):
+            # reasoning models last, everything else first
             if any(k in m for k in ("r1", "distill", "reason", "qwq", "thinking")):
-                return (2, m)   # reasoning models = LAST resort
-            return (1, m)       # normal chat models first
+                return (2, m)
+            return (1, m)
 
         groq_model_cache = sorted(all_models, key=rank)
         print(f"🦙 Groq chat models: {groq_model_cache[:5]}")
@@ -59,14 +59,17 @@ def get_groq_models():
 
 
 def clean_thinking(text):
-    """Strip reasoning-model 'thinking' leakage."""
-    return re.sub(r"", "", text, flags=re.DOTALL).strip()
+    """Remove reasoning-model 'thinking' output leakage."""
+    # Removes blocks and any leading unclosed think section
+    text = re.sub(r"|$)", "", text, flags=re.DOTALL)
+    return text.strip()
 
 
 def ask_groq(prompt):
     """FREE fallback brain via Groq - auto-picks a working model."""
     if not GROQ_API_KEY:
         return None
+    prompt = "Reply ONLY in English.\n\n" + prompt
     candidates = [
         m for m in get_groq_models()
         if not (m.startswith("whisper") or m.startswith("playai"))
@@ -93,6 +96,7 @@ def ask_groq(prompt):
 
 def ask_gemini(prompt, tools=None):
     """Try Gemini models in order (skips out-of-quota), then Groq."""
+    prompt = "Reply ONLY in English.\n\n" + prompt
     for model_name in MODEL_CHAIN:
         try:
             model = genai.GenerativeModel(model_name)
@@ -108,7 +112,6 @@ def ask_gemini(prompt, tools=None):
                 continue
             print(f"Gemini {model_name} error: {e}")
             continue
-    # All Gemini models exhausted -> Groq saves the day
     groq_answer = ask_groq(prompt)
     if groq_answer:
         return groq_answer
@@ -122,7 +125,7 @@ def ask_live(prompt):
     except Exception as e:
         return f"(Live search unavailable: {e})"
 
-# ================= HELPERS =================
+# ============ HELPERS ============
 
 def get_gold_price():
     gold = yf.Ticker("GC=F")
@@ -143,7 +146,7 @@ def send_message(text):
     except Exception as e:
         print(f"Send failed: {e}")
 
-# ================= FLASK WEBHOOK =================
+# ============ FLASK WEBHOOK ============
 
 flask_app = Flask(__name__)
 
@@ -180,7 +183,7 @@ def home():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=5000)
 
-# ================= TELEGRAM COMMANDS =================
+# ============ TELEGRAM COMMANDS ============
 
 async def start(update, context):
     await update.message.reply_text(
@@ -265,8 +268,12 @@ async def news(update, context):
             f"🧠 AI TAKE:\n\n{summary}"
         )
     except Exception as e:
-        answer = ask_live("Summarize today's gold market news summary failed; using live search.")
-        await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}\n\n(error: {e})")
+        await update.message.reply_text(f"📰 RSS failed ({e}). Trying live search...")
+        answer = ask_live(
+            "Summarize today's gold market news in under 150 words. "
+            "Use emojis. Not financial advice."
+        )
+        await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}")
 
 # ---------- ECONOMIC CALENDAR (ForexFactory + live-search fallback) ----------
 
@@ -340,11 +347,12 @@ async def help_cmd(update, context):
         "💬 Or type any question normally!"
     )
 
-# ================= FREE CHAT (Groq FIRST to save Gemini quota!) =================
+# ============ FREE CHAT (Groq FIRST to save Gemini quota!) ============
 
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
-give balanced views, and remind lightly that this is not financial advice."""
+give balanced views, and remind lightly that this is not financial advice.
+Always reply only in English."""
 
 
 async def free_chat(update, context):
@@ -354,7 +362,6 @@ async def free_chat(update, context):
 
     full_prompt = f"{GOLD_CONTEXT}\n\nUser: {user_text}"
 
-    # Free chat FIRST tries Groq (saves precious Gemini quota!)
     reply = ask_groq(full_prompt)
     if not reply:
         reply = ask_gemini(full_prompt)
@@ -365,7 +372,7 @@ async def free_chat(update, context):
     except Exception as e:
         await update.message.reply_text(f"😵 Brain glitch: {e}")
 
-# ================= RUN EVERYTHING =================
+# ============ RUN EVERYTHING ============
 
 brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY!"
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
