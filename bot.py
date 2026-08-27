@@ -1,19 +1,40 @@
 import os
+import re
 import threading
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 import yfinance as yf
 import google.generativeai as genai
+from google import genai as genai_new
+from google.genai import types as genai_types
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- Gemini setup ---
+# --- Gemini setup (legacy SDK - basic calls) ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini = genai.GenerativeModel("gemini-3.7-flash")
+gemini = genai.GenerativeModel("gemini-3.7-flash")  # ✅ YOUR WORKING MODEL
+
+# --- NEW SDK client with GOOGLE SEARCH (live data!) ---
+gclient = genai_new.Client(api_key=os.getenv("GEMINI_API_KEY"))
+SEARCH_MODEL = "gemini-2.0-flash"  # search tool works on this; change if needed
+
+SEARCH_TOOL = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
+
+def ask_live(prompt):
+    """Ask Gemini WITH live Google Search access - knows today's news/prices."""
+    try:
+        resp = gclient.models.generate_content(
+            model=SEARCH_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(tools=SEARCH_TOOL),
+        )
+        return resp.text
+    except Exception as e:
+        return f"(Live search unavailable: {e})"
 
 # ================= HELPERS =================
 
@@ -56,14 +77,12 @@ def webhook():
     signal_type = data.get("signal", "SIGNAL").upper()
     tv_message = data.get("message", "TradingView alert")
 
-    # Instant relay to Telegram
     send_message(
         f"⚡ TRADINGVIEW SIGNAL ⚡\n\n"
         f"🚨 {signal_type} on Gold!\n"
         f"📄 {tv_message}"
     )
 
-    # Gemini's second opinion
     opinion = ask_gemini_signal(signal_type)
     send_message(f"🧠 GEMINI'S OPINION:\n\n{opinion}")
 
@@ -83,9 +102,12 @@ async def start(update, context):
         "👋 Gold Assistant online!\n\n"
         "/price - live price\n"
         "/analyze - AI analysis\n"
+        "/news - today's gold headlines\n"
+        "/calendar - ForexFactory high-impact events\n"
+        "/live - ask AI anything with REAL-TIME web search\n"
         "/webhookstatus - check webhook\n"
         "/help - commands\n\n"
-        "💬 Or just chat with me — ask anything about gold!"
+        "💬 Or just chat with me about gold!"
     )
 
 async def price(update, context):
@@ -113,6 +135,97 @@ async def analyze(update, context):
     except Exception as e:
         await update.message.reply_text(f"❌ Analysis failed: {e}")
 
+# ---------- LIVE SEARCH: real-time news, prices, anything ----------
+
+async def live(update, context):
+    question = " ".join(context.args) if context.args else "What is happening with gold prices today?"
+
+    await update.message.reply_text("🌐 Searching the live web + thinking...")
+    await update.message.chat.send_action("typing")
+
+    answer = ask_live(
+        f"You are a gold trading assistant. Search the web for CURRENT info and answer. "
+        f"Under 200 words, use emojis, include today's key numbers if found. "
+        f"Not financial advice.\n\nQuestion: {question}"
+    )
+    await update.message.reply_text(f"🌐 LIVE ANSWER:\n\n{answer}")
+
+# ---------- NEWS COMMAND (Google News RSS) ----------
+
+def fetch_gold_news():
+    """Today's gold headlines from Google News RSS (free, no key)."""
+    url = "https://news.google.com/rss/search?q=gold+price+when:1d&hl=en-US&gl=US&ceid=US:en"
+    r = requests.get(url, timeout=10)
+    titles = re.findall(r"<title>(.*?)</title>", r.text)[1:8]
+    return [t.replace("&amp;", "&").replace("&#39;", "'") for t in titles]
+
+async def news(update, context):
+    await update.message.reply_text("📰 Fetching today's gold news...")
+    try:
+        headlines = fetch_gold_news()
+        news_text = "\n".join(f"• {h}" for h in headlines)
+
+        prompt = (
+            f"Today's gold headlines:\n{news_text}\n\n"
+            "Under 150 words: today's key theme for gold traders. "
+            "Use emojis. End with 'Not financial advice.'"
+        )
+        summary = gemini.generate_content(prompt).text
+
+        await update.message.reply_text(
+            f"📰 TODAY'S GOLD HEADLINES:\n\n{news_text}\n\n"
+            f"🧠 GEMINI'S TAKE:\n\n{summary}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ News failed: {e}")
+
+# ---------- ECONOMIC CALENDAR (ForexFactory high-impact events) ----------
+
+def fetch_ff_events():
+    """Free ForexFactory weekly calendar - today's & upcoming high-impact only."""
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    r = requests.get(url, timeout=10)
+    events = r.json()
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    out = []
+    for ev in events:
+        impact = str(ev.get("impact", "")).lower()
+        if impact != "high":
+            continue
+        try:
+            when = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+            if when >= now:
+                local = when.strftime("%a %H:%M UTC")
+                out.append(f"🔴 {local} | {ev['country']} | {ev['title']}")
+        except Exception:
+            continue
+    return out[:12]
+
+async def calendar(update, context):
+    await update.message.reply_text("📅 Fetching ForexFactory high-impact events...")
+    try:
+        events = fetch_ff_events()
+        if not events:
+            await update.message.reply_text("✅ No more high-impact events this week!")
+            return
+        event_list = "\n".join(events)
+
+        prompt = (
+            f"Upcoming HIGH-impact economic events:\n{event_list}\n\n"
+            "In under 120 words: which of these matter MOST for gold and why. "
+            "Use emojis. Not financial advice."
+        )
+        take = gemini.generate_content(prompt).text
+
+        await update.message.reply_text(
+            f"📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):\n\n{event_list}\n\n"
+            f"🧠 GOLD IMPACT:\n\n{take}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Calendar failed: {e}")
+
 async def webhookstatus(update, context):
     await update.message.reply_text(
         "🔗 Webhook server runs on port 5000.\n"
@@ -121,11 +234,11 @@ async def webhookstatus(update, context):
 
 async def help_cmd(update, context):
     await update.message.reply_text(
-        "Commands: /start /price /analyze /webhookstatus /help\n\n"
-        "💬 Or type any question normally — I'll answer!"
+        "Commands: /start /price /analyze /news /calendar /live /webhookstatus /help\n\n"
+        "💬 Or type any question normally!"
     )
 
-# ================= FREE CHAT (any normal text -> Gemini) =================
+# ================= FREE CHAT (normal text -> Gemini) =================
 
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
@@ -145,7 +258,7 @@ async def free_chat(update, context):
 # ================= RUN EVERYTHING =================
 
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
-print("💬 Free chat enabled")
+print("💬 Free chat | 📰 /news | 📅 /calendar | 🌐 /live search — ALL READY")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -153,6 +266,9 @@ app = Application.builder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("price", price))
 app.add_handler(CommandHandler("analyze", analyze))
+app.add_handler(CommandHandler("news", news))
+app.add_handler(CommandHandler("calendar", calendar))
+app.add_handler(CommandHandler("live", live))
 app.add_handler(CommandHandler("webhookstatus", webhookstatus))
 app.add_handler(CommandHandler("help", help_cmd))
 
