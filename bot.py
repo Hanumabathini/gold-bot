@@ -13,7 +13,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- Gemini setup ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini = genai.GenerativeModel("gemini-1.5-flash")
+gemini = genai.GenerativeModel("gemini-3.7-flash")
 
 # ================= HELPERS =================
 
