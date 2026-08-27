@@ -255,7 +255,7 @@ async def news(update, context):
         )
         await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}")
 
-# ---------- ECONOMIC CALENDAR (ForexFactory + fallback) ----------
+# ---------- ECONOMIC CALENDAR (ForexFactory + safe fallback) ----------
 
 def fetch_ff_events():
     """ForexFactory weekly calendar - high-impact only."""
@@ -288,7 +288,7 @@ async def calendar(update, context):
     try:
         events = fetch_ff_events()
     except Exception:
-        # FF fetch failed - do NOT let a non-search AI invent events!
+        # FF fetch failed - do NOT let a non-searching AI invent events!
         await update.message.reply_text(
             "⚠️ Couldn't fetch the ForexFactory feed right now.\n"
             "👉 Check high-impact events here:\n"
