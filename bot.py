@@ -16,7 +16,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 gemini = genai.GenerativeModel("gemini-3.7-flash")  # ✅ YOUR WORKING MODEL
 
-# --- Live search: same library, Google Search grounding turned on ---
+# --- Live search: Google Search grounding ---
 def ask_live(prompt):
     """Ask Gemini WITH Google Search access - knows today's news/prices."""
     try:
@@ -95,7 +95,7 @@ async def start(update, context):
         "/price - live price\n"
         "/analyze - AI analysis\n"
         "/news - today's gold headlines\n"
-        "/calendar - ForexFactory high-impact events\n"
+        "/calendar - high-impact economic events\n"
         "/live - ask AI anything with REAL-TIME web search\n"
         "/webhookstatus - check webhook\n"
         "/help - commands\n\n"
@@ -145,7 +145,7 @@ async def live(update, context):
 # ---------- NEWS COMMAND (Google News RSS) ----------
 
 def fetch_gold_news():
-    """Today's gold headlines from Google News RSS (free, no key)."""
+    """Today's gold headlines from Google News RSS (free)."""
     url = "https://news.google.com/rss/search?q=gold+price+when:1d&hl=en-US&gl=US&ceid=US:en"
     r = requests.get(url, timeout=10)
     titles = re.findall(r"<title>(.*?)</title>", r.text)[1:8]
@@ -171,52 +171,63 @@ async def news(update, context):
     except Exception as e:
         await update.message.reply_text(f"❌ News failed: {e}")
 
-# ---------- ECONOMIC CALENDAR (ForexFactory) ----------
+# ---------- ECONOMIC CALENDAR (ForexFactory + live-search fallback) ----------
 
 def fetch_ff_events():
-    """Free ForexFactory weekly calendar - upcoming high-impact only."""
+    """ForexFactory weekly calendar - high-impact only. Browser headers to avoid blocks."""
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    r = requests.get(url, timeout=10)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    r = requests.get(url, headers=headers, timeout=15)
     events = r.json()
 
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     out = []
     for ev in events:
-        impact = str(ev.get("impact", "")).lower()
-        if impact != "high":
+        if str(ev.get("impact", "")).lower() != "high":
             continue
         try:
             when = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
             if when >= now:
-                local = when.strftime("%a %H:%M UTC")
-                out.append(f"🔴 {local} | {ev['country']} | {ev['title']}")
+                out.append(f"🔴 {when.strftime('%a %H:%M UTC')} | {ev['country']} | {ev['title']}")
         except Exception:
             continue
     return out[:12]
 
 async def calendar(update, context):
-    await update.message.reply_text("📅 Fetching ForexFactory high-impact events...")
+    await update.message.reply_text("📅 Fetching high-impact economic events...")
     try:
         events = fetch_ff_events()
-        if not events:
-            await update.message.reply_text("✅ No more high-impact events this week!")
-            return
-        event_list = "\n".join(events)
-
-        prompt = (
-            f"Upcoming HIGH-impact economic events:\n{event_list}\n\n"
-            "In under 120 words: which of these matter MOST for gold and why. "
-            "Use emojis. Not financial advice."
+        source = "📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):"
+    except Exception:
+        answer = ask_live(
+            "Search the web for the upcoming high-impact (red folder) economic events "
+            "this week from ForexFactory (CPI, NFP, FOMC etc). List them with day/time UTC "
+            "and one line on which matters most for gold. Under 150 words, use 🔴 for each. "
+            "Not financial advice."
         )
-        take = gemini.generate_content(prompt).text
+        await update.message.reply_text(f"📅 UPCOMING HIGH-IMPACT EVENTS (via live search):\n\n{answer}")
+        return
 
-        await update.message.reply_text(
-            f"📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):\n\n{event_list}\n\n"
-            f"🧠 GOLD IMPACT:\n\n{take}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Calendar failed: {e}")
+    if not events:
+        await update.message.reply_text("✅ No more high-impact events this week!")
+        return
+    event_list = "\n".join(events)
+
+    prompt = (
+        f"Upcoming HIGH-impact economic events:\n{event_list}\n\n"
+        "In under 120 words: which of these matter MOST for gold and why. "
+        "Use emojis. Not financial advice."
+    )
+    take = gemini.generate_content(prompt).text
+
+    await update.message.reply_text(
+        f"{source}\n\n{event_list}\n\n🧠 GOLD IMPACT:\n\n{take}"
+    )
 
 async def webhookstatus(update, context):
     await update.message.reply_text(
