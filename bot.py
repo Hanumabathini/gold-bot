@@ -13,6 +13,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TWELVEDATA_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 # ============ AI BRAINS: Gemini chain + Groq fallback ============
 
@@ -42,7 +43,6 @@ def clean_thinking(text):
     text = re.sub(
         THINK_OPEN + r".*?" + THINK_CLOSE, "", text, flags=re.DOTALL
     ).strip()
-    # Unclosed thinking block: cut everything from its start
     if THINK_OPEN in text:
         text = text.split(THINK_OPEN)[0].strip()
     return text
@@ -105,9 +105,26 @@ def ask_live(prompt):
     except Exception as e:
         return f"(Live search unavailable: {e})"
 
-# ============ HELPERS ============
+# ============ MARKET DATA: TwelveData first, Yahoo fallback ============
+
+TD_BASE = "https://api.twelvedata.com"
+
 
 def get_gold_price():
+    """Real XAU/USD spot via TwelveData; falls back to Yahoo futures."""
+    if TWELVEDATA_KEY:
+        try:
+            r = requests.get(
+                f"{TD_BASE}/price",
+                params={"symbol": "XAU/USD", "apikey": TWELVEDATA_KEY},
+                timeout=10,
+            )
+            j = r.json()
+            if "price" in j:
+                return round(float(j["price"]), 2)
+            print(f"TwelveData price issue: {j}")
+        except Exception as e:
+            print(f"TwelveData failed, using Yahoo: {e}")
     gold = yf.Ticker("GC=F")
     data = gold.history(period="1d")
     return round(data["Close"].iloc[-1], 2)
@@ -117,6 +134,47 @@ def get_recent_history():
     gold = yf.Ticker("GC=F")
     data = gold.history(period="5d")
     return data[["Close", "High", "Low"]].round(2).to_string()
+
+
+def get_indicator(indicator, interval="15min"):
+    """Real technical indicator from TwelveData (RSI, MACD, EMA...)."""
+    if not TWELVEDATA_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"{TD_BASE}/{indicator}",
+            params={
+                "symbol": "XAU/USD",
+                "interval": interval,
+                "apikey": TWELVEDATA_KEY,
+            },
+            timeout=10,
+        )
+        j = r.json()
+        # Each indicator returns its values under its own name
+        values = j.get("values") or list(j.values())[0].get("values") if isinstance(list(j.values())[0] if j else None, dict) else j.get("values")
+        return values
+    except Exception as e:
+        print(f"TwelveData {indicator} failed: {e}")
+        return None
+
+
+def get_technicals_snapshot():
+    """Compact text block of REAL indicators for the AI (None-safe)."""
+    parts = []
+    rsi = get_indicator("rsi")
+    if rsi:
+        parts.append(f"RSI(14) 15min: {rsi[0].get('rsi', 'n/a')}")
+    ema20 = get_indicator("ema", "15min")
+    if ema20:
+        parts.append(f"EMA20 15min: {ema20[0].get('ema', 'n/a')}")
+    macd = get_indicator("macd")
+    if macd:
+        m = macd[0]
+        parts.append(
+            f"MACD 15min: macd={m.get('macd','n/a')} signal={m.get('signal','n/a')} hist={m.get('hist','n/a')}"
+        )
+    return "\n".join(parts) if parts else None
 
 
 def send_message(text):
@@ -168,8 +226,9 @@ def run_flask():
 async def start(update, context):
     await update.message.reply_text(
         "👋 Gold Assistant online!\n\n"
-        "/price - live price\n"
-        "/analyze - AI analysis\n"
+        "/price - live XAU/USD price\n"
+        "/analyze - AI analysis with REAL indicators\n"
+        "/indicators - RSI / EMA / MACD snapshot\n"
         "/news - today's gold headlines\n"
         "/calendar - high-impact economic events\n"
         "/live - ask AI anything with REAL-TIME web search\n"
@@ -182,9 +241,28 @@ async def start(update, context):
 async def price(update, context):
     await update.message.reply_text("⏳ Fetching...")
     try:
-        await update.message.reply_text(f"🥇 Gold: ${get_gold_price():,.2f}")
+        source = "TwelveData (spot)" if TWELVEDATA_KEY else "Yahoo (GC=F)"
+        await update.message.reply_text(f"🥇 Gold: ${get_gold_price():,.2f}\n📡 Source: {source}")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def indicators_cmd(update, context):
+    await update.message.reply_text("📊 Fetching REAL indicators...")
+    snap = get_technicals_snapshot()
+    if not snap:
+        await update.message.reply_text(
+            "⚠️ Indicators need a TWELVEDATA_API_KEY (free at twelvedata.com).\n"
+            "Add it to Render Environment and redeploy!"
+        )
+        return
+    current = get_gold_price()
+    take = ask_gemini(
+        f"Current gold price: ${current}\nReal indicator readings:\n{snap}\n\n"
+        "In under 100 words: what do these indicators say about short-term "
+        "momentum? Bullish/bearish/neutral and why. Use emojis. Not financial advice."
+    )
+    await update.message.reply_text(f"📊 REAL TECHNICALS (15min):\n\n{snap}\n\n🧠 AI READ:\n\n{take}")
 
 
 async def analyze(update, context):
@@ -192,9 +270,14 @@ async def analyze(update, context):
     try:
         history = get_recent_history()
         current = get_gold_price()
+        tech = get_technicals_snapshot()
         prompt = (
             "You are a gold market assistant for a retail trader. "
             f"Recent gold futures data:\n{history}\n\nCurrent price: ${current}\n\n"
+        )
+        if tech:
+            prompt += f"REAL indicator readings:\n{tech}\n\n"
+        prompt += (
             "SHORT analysis (max 150 words): trend, key levels, one-sentence outlook. "
             "Use emojis. Add a not-financial-advice reminder."
         )
@@ -288,7 +371,6 @@ async def calendar(update, context):
     try:
         events = fetch_ff_events()
     except Exception:
-        # FF fetch failed - do NOT let a non-searching AI invent events!
         await update.message.reply_text(
             "⚠️ Couldn't fetch the ForexFactory feed right now.\n"
             "👉 Check high-impact events here:\n"
@@ -317,13 +399,14 @@ async def calendar(update, context):
 async def webhookstatus(update, context):
     await update.message.reply_text(
         "🔗 Webhook server runs on port 5000.\n"
-        "TradingView signals arrive instantly when everything is running!"
+        "TradingView signals arrive instantly when everything is running!\n"
+        "Webhook URL for TradingView: https://YOUR-RENDER-APP.onrender.com/webhook"
     )
 
 
 async def help_cmd(update, context):
     await update.message.reply_text(
-        "Commands: /start /price /analyze /news /calendar /live /webhookstatus /help\n\n"
+        "Commands: /start /price /analyze /indicators /news /calendar /live /webhookstatus /help\n\n"
         "💬 Or type any question normally!"
     )
 
@@ -336,7 +419,7 @@ Always reply only in English.
 IMPORTANT: You have NO access to live prices, charts, indicators, or calendars.
 NEVER invent price numbers, RSI values, levels, dates, or events.
 If asked for current/live data, charts, or technical indicator readings, reply exactly:
-"I can't see live charts - use /price for the live gold price, /analyze for AI analysis of real recent data, or /live for real-time web search."
+"I can't see live charts - use /price for the live gold price, /analyze for AI analysis of real recent data, /indicators for real RSI/MACD, or /live for real-time web search."
 You MAY freely explain concepts, strategies, indicator math, and general knowledge."""
 
 
@@ -360,8 +443,10 @@ async def free_chat(update, context):
 # ============ RUN EVERYTHING ============
 
 brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY!"
+td_status = "✅" if TWELVEDATA_KEY else "⚠️ Yahoo-only (add TWELVEDATA_API_KEY)"
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
 print(f"🧠 Dual-brain: Gemini(3 models) → Groq hard-coded chain {brain_status}")
+print(f"📡 Market data: TwelveData → Yahoo fallback {td_status}")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -369,6 +454,7 @@ app = Application.builder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("price", price))
 app.add_handler(CommandHandler("analyze", analyze))
+app.add_handler(CommandHandler("indicators", indicators_cmd))
 app.add_handler(CommandHandler("news", news))
 app.add_handler(CommandHandler("calendar", calendar))
 app.add_handler(CommandHandler("live", live))
