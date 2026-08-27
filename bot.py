@@ -11,20 +11,67 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# --- Gemini setup ---
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini = genai.GenerativeModel("gemini-3.7-flash")  # ✅ YOUR WORKING MODEL
+# ================= AI BRAINS: Gemini chain + Groq fallback =================
 
-# --- Live search: Google Search grounding ---
-def ask_live(prompt):
-    """Ask Gemini WITH Google Search access - knows today's news/prices."""
+genai.configure(api_key=GEMINI_API_KEY)
+
+MODEL_CHAIN = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+def ask_groq(prompt):
+    """FREE fallback brain via Groq (Llama 3.3 70B)."""
+    if not GROQ_API_KEY:
+        return None
     try:
-        result = gemini.generate_content(
-            prompt,
-            tools="google_search_retrieval",
+        r = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 500,
+            },
+            timeout=30,
         )
-        return result.text
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"]
+        print(f"Groq error {r.status_code}: {r.text[:150]}")
+        return None
+    except Exception as e:
+        print(f"Groq failed: {e}")
+        return None
+
+def ask_gemini(prompt, tools=None):
+    """Try Gemini models in order (skips out-of-quota), then Groq."""
+    for model_name in MODEL_CHAIN:
+        try:
+            model = genai.GenerativeModel(model_name)
+            if tools:
+                resp = model.generate_content(prompt, tools=tools)
+            else:
+                resp = model.generate_content(prompt)
+            return resp.text
+        except Exception as e:
+            err = str(e).lower()
+            if "quota" in err or "429" in err or "exceeded" in err:
+                print(f"⚠️ {model_name} out of quota, trying next...")
+                continue
+            print(f"Gemini {model_name} error: {e}")
+            continue
+    # All Gemini models exhausted -> Groq saves the day
+    groq_answer = ask_groq(prompt)
+    if groq_answer:
+        return groq_answer
+    return "😴 All AI brains are resting (daily quotas used). Try again tomorrow!"
+
+def ask_live(prompt):
+    """AI WITH Google Search grounding (Gemini only - Groq can't search)."""
+    try:
+        return ask_gemini(prompt, tools="google_search_retrieval")
     except Exception as e:
         return f"(Live search unavailable: {e})"
 
@@ -47,18 +94,6 @@ def send_message(text):
     except Exception as e:
         print(f"Send failed: {e}")
 
-def ask_gemini_signal(signal_type):
-    try:
-        prompt = (
-            f"A trading indicator just fired a {signal_type} signal on gold futures. "
-            f"Current price is ${get_gold_price()}. Recent data:\n{get_recent_history()}\n\n"
-            f"In under 60 words, say whether recent price action supports this "
-            f"{signal_type} entry. Start with AGREE or DISAGREE. Not financial advice."
-        )
-        return gemini.generate_content(prompt).text
-    except Exception as e:
-        return f"(Gemini unavailable: {e})"
-
 # ================= FLASK WEBHOOK =================
 
 flask_app = Flask(__name__)
@@ -75,7 +110,13 @@ def webhook():
         f"📄 {tv_message}"
     )
 
-    opinion = ask_gemini_signal(signal_type)
+    prompt = (
+        f"A trading indicator just fired a {signal_type} signal on gold futures. "
+        f"Current price is ${get_gold_price()}. Recent data:\n{get_recent_history()}\n\n"
+        f"In under 60 words, say whether recent price action supports this "
+        f"{signal_type} entry. Start with AGREE or DISAGREE. Not financial advice."
+    )
+    opinion = ask_gemini(prompt)
     send_message(f"🧠 GEMINI'S OPINION:\n\n{opinion}")
 
     return jsonify({"status": "ok"}), 200
@@ -120,9 +161,9 @@ async def analyze(update, context):
             "SHORT analysis (max 150 words): trend, key levels, one-sentence outlook. "
             "Use emojis. Add a not-financial-advice reminder."
         )
-        response = gemini.generate_content(prompt)
+        response_text = ask_gemini(prompt)
         await update.message.reply_text(
-            f"🥇 Gold: ${current:,.2f}\n\n📊 GEMINI ANALYSIS 📊\n\n{response.text}"
+            f"🥇 Gold: ${current:,.2f}\n\n📊 AI ANALYSIS 📊\n\n{response_text}"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Analysis failed: {e}")
@@ -162,19 +203,21 @@ async def news(update, context):
             "Under 150 words: today's key theme for gold traders. "
             "Use emojis. End with 'Not financial advice.'"
         )
-        summary = gemini.generate_content(prompt).text
+        summary = ask_gemini(prompt)
 
         await update.message.reply_text(
             f"📰 TODAY'S GOLD HEADLINES:\n\n{news_text}\n\n"
-            f"🧠 GEMINI'S TAKE:\n\n{summary}"
+            f"🧠 AI TAKE:\n\n{summary}"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ News failed: {e}")
+        # Even if RSS fails, still give a live-search answer
+        answer = ask_live("Summarize today's gold market news in under 150 words. Use emojis. Not financial advice.")
+        await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}\n\n(rss error: {e})")
 
 # ---------- ECONOMIC CALENDAR (ForexFactory + live-search fallback) ----------
 
 def fetch_ff_events():
-    """ForexFactory weekly calendar - high-impact only. Browser headers to avoid blocks."""
+    """ForexFactory weekly calendar - high-impact only."""
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -202,7 +245,6 @@ async def calendar(update, context):
     await update.message.reply_text("📅 Fetching high-impact economic events...")
     try:
         events = fetch_ff_events()
-        source = "📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):"
     except Exception:
         answer = ask_live(
             "Search the web for the upcoming high-impact (red folder) economic events "
@@ -223,10 +265,10 @@ async def calendar(update, context):
         "In under 120 words: which of these matter MOST for gold and why. "
         "Use emojis. Not financial advice."
     )
-    take = gemini.generate_content(prompt).text
+    take = ask_gemini(prompt)
 
     await update.message.reply_text(
-        f"{source}\n\n{event_list}\n\n🧠 GOLD IMPACT:\n\n{take}"
+        f"📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):\n\n{event_list}\n\n🧠 GOLD IMPACT:\n\n{take}"
     )
 
 async def webhookstatus(update, context):
@@ -241,7 +283,7 @@ async def help_cmd(update, context):
         "💬 Or type any question normally!"
     )
 
-# ================= FREE CHAT =================
+# ================= FREE CHAT (routes to cheapest available brain!) =================
 
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
@@ -251,17 +293,25 @@ async def free_chat(update, context):
     user_text = update.message.text
     print(f"💬 Chat received: {user_text}")
     await update.message.chat.send_action("typing")
+
+    full_prompt = f"{GOLD_CONTEXT}\n\nUser: {user_text}"
+
+    # Free chat FIRST tries Groq (saves precious Gemini quota!)
+    reply = ask_groq(full_prompt)
+    if not reply:
+        reply = ask_gemini(full_prompt)
+
     try:
-        response = gemini.generate_content(f"{GOLD_CONTEXT}\n\nUser: {user_text}")
-        await update.message.reply_text(response.text)
+        await update.message.reply_text(reply)
         print("✅ Reply sent")
     except Exception as e:
         await update.message.reply_text(f"😵 Brain glitch: {e}")
 
 # ================= RUN EVERYTHING =================
 
+brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY to .env"
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
-print("💬 Free chat | 📰 /news | 📅 /calendar | 🌐 /live search — ALL READY")
+print(f"🧠 Dual-brain: Gemini(3 models) → Groq fallback {brain_status}")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
