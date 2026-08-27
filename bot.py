@@ -6,33 +6,25 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 import yfinance as yf
 import google.generativeai as genai
-from google import genai as genai_new
-from google.genai import types as genai_types
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- Gemini setup (legacy SDK - basic calls) ---
+# --- Gemini setup ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 gemini = genai.GenerativeModel("gemini-3.7-flash")  # ✅ YOUR WORKING MODEL
 
-# --- NEW SDK client with GOOGLE SEARCH (live data!) ---
-gclient = genai_new.Client(api_key=os.getenv("GEMINI_API_KEY"))
-SEARCH_MODEL = "gemini-2.0-flash"  # search tool works on this; change if needed
-
-SEARCH_TOOL = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
-
+# --- Live search: same library, Google Search grounding turned on ---
 def ask_live(prompt):
-    """Ask Gemini WITH live Google Search access - knows today's news/prices."""
+    """Ask Gemini WITH Google Search access - knows today's news/prices."""
     try:
-        resp = gclient.models.generate_content(
-            model=SEARCH_MODEL,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(tools=SEARCH_TOOL),
+        result = gemini.generate_content(
+            prompt,
+            tools="google_search_retrieval",
         )
-        return resp.text
+        return result.text
     except Exception as e:
         return f"(Live search unavailable: {e})"
 
@@ -135,7 +127,7 @@ async def analyze(update, context):
     except Exception as e:
         await update.message.reply_text(f"❌ Analysis failed: {e}")
 
-# ---------- LIVE SEARCH: real-time news, prices, anything ----------
+# ---------- LIVE SEARCH ----------
 
 async def live(update, context):
     question = " ".join(context.args) if context.args else "What is happening with gold prices today?"
@@ -179,10 +171,10 @@ async def news(update, context):
     except Exception as e:
         await update.message.reply_text(f"❌ News failed: {e}")
 
-# ---------- ECONOMIC CALENDAR (ForexFactory high-impact events) ----------
+# ---------- ECONOMIC CALENDAR (ForexFactory) ----------
 
 def fetch_ff_events():
-    """Free ForexFactory weekly calendar - today's & upcoming high-impact only."""
+    """Free ForexFactory weekly calendar - upcoming high-impact only."""
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     r = requests.get(url, timeout=10)
     events = r.json()
@@ -238,7 +230,7 @@ async def help_cmd(update, context):
         "💬 Or type any question normally!"
     )
 
-# ================= FREE CHAT (normal text -> Gemini) =================
+# ================= FREE CHAT =================
 
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
