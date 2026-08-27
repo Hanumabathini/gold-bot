@@ -42,7 +42,7 @@ def clean_thinking(text):
     text = re.sub(
         THINK_OPEN + r".*?" + THINK_CLOSE, "", text, flags=re.DOTALL
     ).strip()
-    # Unclosed thinking block: if it opens but never closes, cut to last close or drop all
+    # Unclosed thinking block: cut everything from its start
     if THINK_OPEN in text:
         text = text.split(THINK_OPEN)[0].strip()
     return text
@@ -255,7 +255,7 @@ async def news(update, context):
         )
         await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}")
 
-# ---------- ECONOMIC CALENDAR (ForexFactory + live-search fallback) ----------
+# ---------- ECONOMIC CALENDAR (ForexFactory + fallback) ----------
 
 def fetch_ff_events():
     """ForexFactory weekly calendar - high-impact only."""
@@ -288,13 +288,13 @@ async def calendar(update, context):
     try:
         events = fetch_ff_events()
     except Exception:
-        answer = ask_live(
-            "Search the web for the upcoming high-impact (red folder) economic events "
-            "this week from ForexFactory (CPI, NFP, FOMC etc). List them with day/time UTC "
-            "and one line on which matters most for gold. Under 150 words, use 🔴 for each. "
-            "Not financial advice."
+        # FF fetch failed - do NOT let a non-search AI invent events!
+        await update.message.reply_text(
+            "⚠️ Couldn't fetch the ForexFactory feed right now.\n"
+            "👉 Check high-impact events here:\n"
+            "https://www.forexfactory.com/calendar\n\n"
+            "💡 Tip: try again later, or use /live for web-searched answers."
         )
-        await update.message.reply_text(f"📅 UPCOMING HIGH-IMPACT EVENTS (via live search):\n\n{answer}")
         return
 
     if not events:
@@ -332,7 +332,12 @@ async def help_cmd(update, context):
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
 give balanced views, and remind lightly that this is not financial advice.
-Always reply only in English."""
+Always reply only in English.
+IMPORTANT: You have NO access to live prices, charts, indicators, or calendars.
+NEVER invent price numbers, RSI values, levels, dates, or events.
+If asked for current/live data, charts, or technical indicator readings, reply exactly:
+"I can't see live charts - use /price for the live gold price, /analyze for AI analysis of real recent data, or /live for real-time web search."
+You MAY freely explain concepts, strategies, indicator math, and general knowledge."""
 
 
 async def free_chat(update, context):
