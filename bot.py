@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 import yfinance as yf
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -31,7 +32,7 @@ ALERT_CHECK_SECONDS = 300
 
 # ============ AI BRAINS ============
 
-genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 MODEL_CHAIN = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-flash-latest"]
 
@@ -82,15 +83,23 @@ def ask_groq(prompt):
     return None
 
 
-def ask_gemini(prompt, tools=None):
+def ask_gemini(prompt, use_search=False):
+    if not GEMINI_CLIENT:
+        print("⚠️ GEMINI_API_KEY not set, skipping straight to Groq")
+        return ask_groq(prompt)
     prompt = "Reply ONLY in English.\n\n" + prompt
+    config = None
+    if use_search:
+        config = genai_types.GenerateContentConfig(
+            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
+        )
     for model_name in MODEL_CHAIN:
         try:
-            model = genai.GenerativeModel(model_name)
-            if tools:
-                resp = model.generate_content(prompt, tools=tools)
-            else:
-                resp = model.generate_content(prompt)
+            resp = GEMINI_CLIENT.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
             return resp.text
         except Exception as e:
             err = str(e).lower()
@@ -535,7 +544,7 @@ def get_events_resilient():
         "Search the web: list the upcoming HIGH-impact economic events in the next 3 days "
         "(US and EU mainly) that matter for gold. Format each line exactly as: "
         "🔴 Day HH:MM UTC | COUNTRY | Event name. Max 10 lines, no other text.",
-        tools="google_search_retrieval",
+        use_search=True,
     )
     if ai:
         lines = [l.strip() for l in ai.split("\n") if l.strip().startswith("🔴")]
@@ -760,7 +769,7 @@ async def live(update, context):
         f"You are a gold trading assistant. Search the web for CURRENT info and answer. "
         f"Under 200 words, use emojis, include today's key numbers if found. "
         f"Not financial advice.\n\nQuestion: {question}",
-        tools="google_search_retrieval",
+        use_search=True,
     )
     await update.message.reply_text(f"🌐 LIVE ANSWER:\n\n{answer or '😴 AI brains resting — try /news!'}")
 
@@ -786,7 +795,7 @@ async def news(update, context):
         answer = ask_gemini(
             "Summarize today's gold market news in under 150 words. "
             "Use emojis. Not financial advice.",
-            tools="google_search_retrieval",
+            use_search=True,
         )
         await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer or '😴 AI brains resting!'}")
 
