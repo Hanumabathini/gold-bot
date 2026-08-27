@@ -36,7 +36,15 @@ GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # All four are currently free-tier eligible per ai.google.dev/gemini-api/docs/pricing —
 # spread across more free models so one model's exhausted quota doesn't kill the whole chain.
-MODEL_CHAIN = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+MODEL_CHAIN = [
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
 
 # Plain-text fallback chain — fast/cheap models, no live web search.
 # (allam-2-7b was removed: it's no longer a listed Groq model, so that slot was dead weight.)
