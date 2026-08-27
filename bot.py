@@ -34,15 +34,18 @@ ALERT_CHECK_SECONDS = 300
 
 GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-MODEL_CHAIN = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest"]
+# All four are currently free-tier eligible per ai.google.dev/gemini-api/docs/pricing —
+# spread across more free models so one model's exhausted quota doesn't kill the whole chain.
+MODEL_CHAIN = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]
 
 # Plain-text fallback chain — fast/cheap models, no live web search.
+# (allam-2-7b was removed: it's no longer a listed Groq model, so that slot was dead weight.)
 GROQ_MODEL_CHAIN = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
     "qwen/qwen3.6-27b",
-    "allam-2-7b",
+    "llama-3.3-70b-versatile",
 ]
 # Search-needed fallback chain — leads with Groq's Compound systems, which have
 # genuine built-in real-time web search (see console.groq.com/docs/compound).
@@ -774,8 +777,10 @@ async def live(update, context):
     await update.message.reply_text("🌐 Searching the live web + thinking...")
     await update.message.chat.send_action("typing")
     answer = ask_gemini(
-        f"You are a gold trading assistant. Search the web for CURRENT info and answer. "
-        f"Under 200 words, use emojis, include today's key numbers if found. "
+        f"You are a gold trading assistant with a real-time web search tool available. "
+        f"You MUST use that tool right now to look up current gold market info before answering — "
+        f"do not say you lack live access, you have it. "
+        f"Under 200 words, use emojis, include today's actual key numbers found via search. "
         f"Not financial advice.\n\nQuestion: {question}",
         use_search=True,
     )
