@@ -5,6 +5,7 @@ import json
 import base64
 import threading
 import time
+import statistics
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ TWELVEDATA_KEY = os.getenv("TWELVEDATA_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. Hanumabathini/gold-bot
 
-BRIEFING_HOUR_UTC = int(os.getenv("BRIEFING_HOUR_UTC", "2"))  # 2 UTC = 7:30 AM IST
+BRIEFING_HOUR_UTC = int(os.getenv("BRIEFING_HOUR_UTC", "2"))
 ALERT_CHECK_SECONDS = 300
 
 # ============ AI BRAINS ============
@@ -219,11 +220,13 @@ def send_photo(png_buffer, caption):
     except Exception as e:
         print(f"Photo send failed: {e}")
 
-# ============ TRADE JOURNAL -> GITHUB ============
+# ============ GITHUB STORAGE (Journal + Stats) ============
 
 GH_API = "https://api.github.com"
 JOURNAL_DIR = "Journal"
 JOURNAL_FILE = "trades.md"
+STATS_FILE = "stats.json"
+STATS_PATH = f"{JOURNAL_DIR}/{STATS_FILE}"
 
 
 def gh_headers():
@@ -267,6 +270,30 @@ def gh_write_file(new_content, sha):
         raise Exception(f"GitHub write failed {r.status_code}: {r.text[:150]}{hint}")
 
 
+def gh_read_json(path):
+    url = f"{GH_API}/repos/{GITHUB_REPO}/contents/{path}"
+    r = requests.get(url, headers=gh_headers(), timeout=15)
+    if r.status_code == 200:
+        j = r.json()
+        return j["sha"], json.loads(base64.b64decode(j["content"]).decode("utf-8"))
+    if r.status_code == 404:
+        return None, {"trades": []}
+    raise Exception(f"GitHub read {path} failed {r.status_code}")
+
+
+def gh_write_json(path, data, sha):
+    url = f"{GH_API}/repos/{GITHUB_REPO}/contents/{path}"
+    body = {
+        "message": f"📊 stats update {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        "content": base64.b64encode(json.dumps(data, indent=2).encode()).decode("ascii"),
+    }
+    if sha:
+        body["sha"] = sha
+    r = requests.put(url, headers=gh_headers(), json=body, timeout=20)
+    if r.status_code not in (200, 201):
+        raise Exception(f"GitHub write {path} failed {r.status_code}: {r.text[:150]}")
+
+
 def add_journal_entry(text):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     price_line = ""
@@ -289,6 +316,31 @@ def get_recent_entries(n=5):
     blocks = content.split("\n## ")
     blocks = [b if b.startswith("## ") else "## " + b for b in blocks if b.strip()]
     return blocks[-n:] if blocks else None
+
+
+def parse_note_fields(text):
+    """Extract direction/SL/TP/entry from a note like:
+    'LONG 4606 SL 4590 TP 4650 - breakout retest'"""
+    t = text.upper()
+    fields = {}
+    m = re.search(r"\b(LONG|SHORT|BUY|SELL)\b", t)
+    if m:
+        d = m.group(1)
+        fields["direction"] = "LONG" if d in ("LONG", "BUY") else "SHORT"
+    nums = re.findall(r"\b(?:SL|STOP)[\s:@]*([0-9]+(?:\.[0-9]+)?)", t)
+    if nums:
+        fields["sl"] = float(nums[0])
+    nums = re.findall(r"\b(?:TP|TARGET)[\s:@]*([0-9]+(?:\.[0-9]+)?)", t)
+    if nums:
+        fields["tp"] = float(nums[0])
+    nums = re.findall(r"(?<![\w.])([0-9]{4}(?:\.[0-9]+)?)(?![\w.])", t)
+    if "sl" in fields or "tp" in fields:
+        for n in nums:
+            v = float(n)
+            if v not in (fields.get("sl"), fields.get("tp")):
+                fields["entry"] = v
+                break
+    return fields
 
 # ============ TELEGRAM SEND ============
 
@@ -375,7 +427,7 @@ def build_briefing_text():
     tech = get_technicals_snapshot()
     events = []
     try:
-        events = fetch_ff_events()
+        events, _ = get_events_resilient()
     except Exception:
         pass
     headlines = []
@@ -421,7 +473,7 @@ def daily_briefing_loop():
             print(f"Briefing error: {e}")
         time.sleep(60)
 
-# ============ NEWS / CALENDAR FEEDS ============
+# ============ NEWS / CALENDAR (resilience chain) ============
 
 
 def fetch_gold_news():
@@ -451,7 +503,46 @@ def fetch_ff_events():
                 out.append(f"🔴 {when.strftime('%a %H:%M UTC')} | {ev['country']} | {ev['title']}")
         except Exception:
             continue
+    if not out:
+        raise Exception("FF feed returned no upcoming events")
     return out[:12]
+
+
+CALENDAR_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar_cache.json")
+
+
+def get_events_resilient():
+    """Chain: FF feed -> cache -> AI web search. Returns (events, source_label)."""
+    try:
+        events = fetch_ff_events()
+        with open(CALENDAR_CACHE, "w") as f:
+            json.dump({"fetched": datetime.now(timezone.utc).isoformat(), "events": events}, f)
+        return events, "ForexFactory (live)"
+    except Exception as e:
+        print(f"FF feed failed: {e}")
+
+    try:
+        with open(CALENDAR_CACHE, "r") as f:
+            cache = json.load(f)
+        fetched = datetime.fromisoformat(cache["fetched"])
+        age_h = (datetime.now(timezone.utc) - fetched).total_seconds() / 3600
+        if cache.get("events"):
+            return cache["events"], f"cached ({age_h:.0f}h old)"
+    except Exception:
+        pass
+
+    ai = ask_gemini(
+        "Search the web: list the upcoming HIGH-impact economic events in the next 3 days "
+        "(US and EU mainly) that matter for gold. Format each line exactly as: "
+        "🔴 Day HH:MM UTC | COUNTRY | Event name. Max 10 lines, no other text.",
+        tools="google_search_retrieval",
+    )
+    if ai:
+        lines = [l.strip() for l in ai.split("\n") if l.strip().startswith("🔴")]
+        if lines:
+            return lines[:12], "AI web search"
+
+    raise Exception("All calendar sources failed")
 
 # ============ FLASK WEBHOOK ============
 
@@ -495,7 +586,7 @@ def run_flask():
 
 async def start(update, context):
     await update.message.reply_text(
-        "👋 Gold Assistant online (v6)!\n\n"
+        "👋 Gold Assistant online (v6.1)!\n\n"
         "/price - live XAU/USD price\n"
         "/chart - candlestick chart photo 📸\n"
         "/analyze - AI analysis with REAL indicators\n"
@@ -503,12 +594,14 @@ async def start(update, context):
         "/alert <price> - price alert (e.g. /alert 4700)\n"
         "/alerts - list active alerts\n"
         "/risk <account> <risk%> <entry> <stop> - position size 🧮\n"
+        "/note <text> - log trade to journal 📓 (use SL/TP keywords!)\n"
+        "/close <+2R> - mark a trade closed 📊\n"
+        "/stats - win rate scoreboard 🏆\n"
+        "/trades - last 5 journal entries\n"
+        "/summary - AI reviews your journal\n"
         "/news - today's gold headlines\n"
         "/calendar - high-impact economic events\n"
         "/live - ask AI with REAL-TIME web search\n"
-        "/note <text> - log to your Obsidian journal 📓\n"
-        "/trades - last 5 journal entries\n"
-        "/summary - AI reviews your journal\n"
         "/help - full list\n\n"
         f"⏰ Daily briefing: {BRIEFING_HOUR_UTC}:00 UTC\n"
         "💬 Or just chat with me about gold!"
@@ -652,7 +745,7 @@ async def risk(update, context):
             f"📏 Stop distance: ${stop_distance:,.2f}\n\n"
             f"✅ Position: {position_oz:,.2f} oz\n"
             f"✅ ≈ {lots_xau:.3f} standard lots (XAUUSD)\n\n"
-            f"💡 Each 1move=1 move =1move={position_oz:,.2f} P&L\n"
+            f"💡 Each $1 price move = ${position_oz:,.2f} P&L\n"
             "Not financial advice — manage your risk! 🛡️"
         )
     except ValueError:
@@ -701,24 +794,23 @@ async def news(update, context):
 async def calendar(update, context):
     await update.message.reply_text("📅 Fetching high-impact economic events...")
     try:
-        events = fetch_ff_events()
+        events, source = get_events_resilient()
     except Exception:
         await update.message.reply_text(
-            "⚠️ Couldn't fetch the ForexFactory feed right now.\n"
+            "⚠️ All calendar sources failed right now\n"
             "👉 https://www.forexfactory.com/calendar\n"
-            "💡: try again later, or use /live."
+            "💡 Or ask me directly: /live what events today affect gold?"
         )
         return
-    if not events:
-        await update.message.reply_text("✅ No more high-impact events this week!")
-        return
+    if source.startswith("cached"):
+        await update.message.reply_text(f"⚠️ Live feed blocked — showing {source} calendar:")
     event_list = "\n".join(events)
     take = ask_gemini(
         f"Upcoming HIGH-impact economic events:\n{event_list}\n\n"
         "In under 120 words: which of these matter MOST for gold and why. "
         "Use emojis. Not financial advice."
     )
-    text = f"📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):\n\n{event_list}"
+    text = f"📅 UPCOMING HIGH-IMPACT NEWS ({source}):\n\n{event_list}"
     if take:
         text += f"\n\n🧠 GOLD IMPACT:\n\n{take}"
     await update.message.reply_text(text)
@@ -728,7 +820,8 @@ async def note(update, context):
     text = " ".join(context.args).strip()
     if not text:
         await update.message.reply_text(
-            "📓 Usage: /note LONG 4650 SL 4630 TP 4700 - breakout retest"
+            "📓 Usage: /note LONG 4606 SL 4590 TP 4650 - breakout retest\n"
+            "(SL/TP keywords are optional but make /stats smarter!)"
         )
         return
     if not (GITHUB_TOKEN and GITHUB_REPO):
@@ -736,13 +829,120 @@ async def note(update, context):
         return
     await update.message.reply_text("📓 Saving to journal...")
     try:
+        fields = parse_note_fields(text)
         stamp = add_journal_entry(text)
+        sha, stats = gh_read_json(STATS_PATH)
+        stats["trades"].append({
+            "note": text[:200],
+            "opened": stamp,
+            "fields": fields,
+            "closed": None,
+        })
+        gh_write_json(STATS_PATH, stats, sha)
+        struct = ""
+        if fields:
+            struct = "\n🔍 Detected: " + " | ".join(f"{k}={v}" for k, v in fields.items())
         await update.message.reply_text(
-            f"✅ Saved to Journal/trades.md!\n\n🕒 {stamp}\n📝 {text}\n\n"
-            "→ Committed to GitHub. Pull in Obsidian to see it! 🎉"
+            f"✅ Saved to Journal/trades.md!\n\n🕒 {stamp}\n📝 {text}{struct}\n\n"
+            "When you exit: /close +2R (or -1R) 📊"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Journal save failed: {e}")
+
+
+async def close(update, context):
+    """Usage: /close +2R optional comment   or   /close -1R stopped out"""
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "📊 Usage: /close <result in R>\n"
+            "Examples:\n/close +2R hit TP cleanly\n/close -1R stopped out\n"
+            "/close 0R scratched, flat exit"
+        )
+        return
+    m = re.search(r"([+-]?[0-9]+(?:\.[0-9]+)?)\s*R\b", text.upper())
+    if not m:
+        await update.message.reply_text("❌ Include the R multiple, e.g. /close +2R or /close -1R")
+        return
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        await update.message.reply_text("⚠️ Stats need GITHUB_TOKEN + GITHUB_REPO in environment!")
+        return
+    r_mult = float(m.group(1))
+    comment = text[m.end():].strip(" -–")
+    try:
+        sha, stats = gh_read_json(STATS_PATH)
+        open_trades = [t for t in stats["trades"] if t.get("closed") is None]
+        entry = {
+            "closed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "r": r_mult,
+            "comment": comment,
+        }
+        if open_trades:
+            open_trades[-1]["closed"] = entry
+            label = open_trades[-1].get("note", "trade")[:60]
+        else:
+            stats["trades"].append({"note": "(no matching open note)", "closed": entry})
+            label = "standalone result"
+        gh_write_json(STATS_PATH, stats, sha)
+        emoji = "✅" if r_mult > 0 else ("🟡" if r_mult == 0 else "🛑")
+        await update.message.reply_text(
+            f"{emoji} Trade closed: {r_mult:+.1f}R\n📝 {label}\n"
+            + (f"💬 {comment}\n" if comment else "")
+            + "\n📊 See the scoreboard: /stats"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Close failed: {e}")
+
+
+async def stats(update, context):
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        await update.message.reply_text("⚠️ Stats need GITHUB_TOKEN + GITHUB_REPO in environment!")
+        return
+    try:
+        _, stats = gh_read_json(STATS_PATH)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Couldn't read stats: {e}")
+        return
+    closed = [t["closed"] for t in stats["trades"] if t.get("closed")]
+    if not closed:
+        await update.message.reply_text(
+            "📊 No closed trades yet!\n"
+            "Workflow: /note open the trade → /close +2R when done."
+        )
+        return
+    rs = [c["r"] for c in closed]
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r < 0]
+    win_rate = len(wins) / len(rs) * 100
+    total_r = sum(rs)
+    avg_r = total_r / len(rs)
+    best = max(rs)
+    worst = min(rs)
+    streak, best_streak = 0, 0
+    for r in rs:
+        streak = streak + 1 if r > 0 else 0
+        best_streak = max(best_streak, streak)
+    bar_w, bar_l = "🟩" * len(wins), "🟥" * len(losses)
+    verdict = ""
+    if len(rs) >= 5:
+        if total_r > 0 and win_rate >= 45:
+            verdict = "💪 Positive expectancy — the system is working. Stay disciplined."
+        elif total_r > 0:
+            verdict = "🟢 Profitable but fragile — protect those wins, tighten entries."
+        else:
+            verdict = "⚠️ Negative expectancy — reduce size, review entries with /summary."
+    await update.message.reply_text(
+        f"📊 TRADING SCOREBOARD\n\n"
+        f"🔒 Closed trades: {len(rs)}\n"
+        f"🏆 Win rate: {win_rate:.0f}% ({len(wins)}W / {len(losses)}L"
+        + (f" / {len(rs)-len(wins)-len(losses)}BE)" if len(rs) - len(wins) - len(losses) else ")")
+        + f"\n💰 Total: {total_r:+.1f}R | Avg: {avg_r:+.2f}R per trade\n"
+        f"🔥 Best streak: {best_streak} wins\n"
+        f"⭐ Best: {best:+.1f}R | 💀 Worst: {worst:+.1f}R\n\n"
+        f"{bar_w}{bar_l}\n"
+        + (f"\n🧠 {verdict}" if verdict else "\n📈 Log 5+ closed trades for an AI verdict")
+        + "\n\nNot financial advice 🛡️"
+    )
 
 
 async def trades(update, context):
@@ -784,7 +984,7 @@ async def summary(update, context):
 async def help_cmd(update, context):
     await update.message.reply_text(
         "Commands: /start /price /chart /analyze /indicators /alert /alerts /risk "
-        "/news /calendar /live /note /trades /summary /help\n\n"
+        "/note /close /stats /trades /summary /news /calendar /live /help\n\n"
         "💬 Or type any question normally!"
     )
 
@@ -823,10 +1023,10 @@ async def free_chat(update, context):
 brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY!"
 td_status = "✅" if TWELVEDATA_KEY else "⚠️ Yahoo-only"
 gh_status = "✅" if (GITHUB_TOKEN and GITHUB_REPO) else "⚠️ journal off"
-print("🤖 Starting bot v6 + webhook server (port 5000)... press Ctrl+C to stop")
+print("🤖 Starting bot v6.1 + webhook server (port 5000)... press Ctrl+C to stop")
 print(f"🧠 Dual-brain: Gemini(3 models) → Groq chain {brain_status}")
 print(f"📡 Market data: TwelveData → Yahoo {td_status}")
-print(f"📓 Journal → GitHub/{JOURNAL_DIR}: {gh_status} (repo: {GITHUB_REPO})")
+print(f"📓 Journal + Stats → GitHub/{JOURNAL_DIR}: {gh_status} (repo: {GITHUB_REPO})")
 print(f"⏰ Daily briefing: {BRIEFING_HOUR_UTC}:00 UTC")
 
 threading.Thread(target=run_flask, daemon=True).start()
@@ -846,6 +1046,8 @@ app.add_handler(CommandHandler("news", news))
 app.add_handler(CommandHandler("calendar", calendar))
 app.add_handler(CommandHandler("live", live))
 app.add_handler(CommandHandler("note", note))
+app.add_handler(CommandHandler("close", close))
+app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("trades", trades))
 app.add_handler(CommandHandler("summary", summary))
 app.add_handler(CommandHandler("help", help_cmd))
@@ -854,4 +1056,3 @@ app.add_handler(CommandHandler("help", help_cmd))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_chat))
 
 app.run_polling()
-
