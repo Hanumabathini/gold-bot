@@ -12,7 +12,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = auto = os.getenv("GROQ_API_KEY")
 
 # ================= AI BRAINS: Gemini chain + Groq auto-discovery fallback =================
 
@@ -24,8 +24,9 @@ GROQ_URL = f"{GROQ_BASE}/chat/completions"
 
 groq_model_cache = None  # discovered once at runtime
 
+
 def get_groq_models():
-    """Ask Groq which models this key can actually use - pick best chat ones."""
+    """Ask Groq which models this key can actually use - chat models first."""
     global groq_model_cache
     if groq_model_cache is None:
         try:
@@ -35,22 +36,42 @@ def get_groq_models():
                 timeout=15,
             )
             all_models = [m["id"] for m in r.json().get("data", [])]
-            # Keep only chat models (drop audio/tts/guard models)
-            groq_model_cache = [
-                m for m in all_models
-                if "whisper" not in m and "tts" not in m and "guard" not in m
-            ]
-            print(f"🦙 Groq models available: {groq_model_cache[:5]}")
         except Exception as e:
             print(f"Groq model discovery failed: {e}")
             groq_model_cache = []
+            return groq_model_cache
+
+        # Drop obviously non-chat models (audio/tts/guard)
+        all_models = [
+            m for m in all_models
+            if not any(k in m for k in ("whisper", "tts", "guard"))
+        ]
+
+        # Prefer classic fast chat models; push reasoning models last
+        def rank(m):
+            if any(k in m for k in ("r1", "distill", "reason", "qwq", "thinking")):
+                return (2, m)   # reasoning models = LAST resort
+            return (1, m)       # normal chat models first
+
+        groq_model_cache = sorted(all_models, key=rank)
+        print(f"🦙 Groq chat models: {groq_model_cache[:5]}")
     return groq_model_cache
+
+
+def clean_thinking(text):
+    """Strip reasoning-model 'thinking' leakage."""
+    return re.sub(r"", "", text, flags=re.DOTALL).strip()
+
 
 def ask_groq(prompt):
     """FREE fallback brain via Groq - auto-picks a working model."""
     if not GROQ_API_KEY:
         return None
-    for gm in get_groq_models()[:5]:
+    candidates = [
+        m for m in get_groq_models()
+        if not (m.startswith("whisper") or m.startswith("playai"))
+    ]
+    for gm in candidates[:6]:
         try:
             r = requests.post(
                 GROQ_URL,
@@ -63,11 +84,12 @@ def ask_groq(prompt):
                 timeout=30,
             )
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
+                return clean_thinking(r.json()["choices"][0]["message"]["content"])
             print(f"Groq {gm} error {r.status_code}: {r.text[:150]}")
         except Exception as e:
             print(f"Groq {gm} failed: {e}")
     return None
+
 
 def ask_gemini(prompt, tools=None):
     """Try Gemini models in order (skips out-of-quota), then Groq."""
@@ -92,6 +114,7 @@ def ask_gemini(prompt, tools=None):
         return groq_answer
     return "😴 All AI brains are resting (daily quotas used). Try again tomorrow!"
 
+
 def ask_live(prompt):
     """AI WITH Google Search grounding (Gemini only - Groq can't search)."""
     try:
@@ -106,10 +129,12 @@ def get_gold_price():
     data = gold.history(period="1d")
     return round(data["Close"].iloc[-1], 2)
 
+
 def get_recent_history():
     gold = yf.Ticker("GC=F")
     data = gold.history(period="5d")
     return data[["Close", "High", "Low"]].round(2).to_string()
+
 
 def send_message(text):
     try:
@@ -121,6 +146,7 @@ def send_message(text):
 # ================= FLASK WEBHOOK =================
 
 flask_app = Flask(__name__)
+
 
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
@@ -145,9 +171,11 @@ def webhook():
 
     return jsonify({"status": "ok"}), 200
 
+
 @flask_app.route("/", methods=["GET"])
 def home():
     return "Gold bot webhook is alive!", 200
+
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=5000)
@@ -167,12 +195,14 @@ async def start(update, context):
         "💬 Or just chat with me about gold!"
     )
 
+
 async def price(update, context):
     await update.message.reply_text("⏳ Fetching...")
     try:
         await update.message.reply_text(f"🥇 Gold: ${get_gold_price():,.2f}")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
+
 
 async def analyze(update, context):
     await update.message.reply_text("🧠 Analyzing... (10-20s)")
@@ -216,6 +246,7 @@ def fetch_gold_news():
     titles = re.findall(r"<title>(.*?)</title>", r.text)[1:8]
     return [t.replace("&amp;", "&").replace("&#39;", "'") for t in titles]
 
+
 async def news(update, context):
     await update.message.reply_text("📰 Fetching today's gold news...")
     try:
@@ -234,8 +265,8 @@ async def news(update, context):
             f"🧠 AI TAKE:\n\n{summary}"
         )
     except Exception as e:
-        answer = ask_live("Summarize today's gold market news in under 150 words. Use emojis. Not financial advice.")
-        await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}\n\n(rss error: {e})")
+        answer = ask_live("Summarize today's gold market news summary failed; using live search.")
+        await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}\n\n(error: {e})")
 
 # ---------- ECONOMIC CALENDAR (ForexFactory + live-search fallback) ----------
 
@@ -263,6 +294,7 @@ def fetch_ff_events():
         except Exception:
             continue
     return out[:12]
+
 
 async def calendar(update, context):
     await update.message.reply_text("📅 Fetching high-impact economic events...")
@@ -294,11 +326,13 @@ async def calendar(update, context):
         f"📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):\n\n{event_list}\n\n🧠 GOLD IMPACT:\n\n{take}"
     )
 
+
 async def webhookstatus(update, context):
     await update.message.reply_text(
         "🔗 Webhook server runs on port 5000.\n"
         "TradingView signals arrive instantly when everything is running!"
     )
+
 
 async def help_cmd(update, context):
     await update.message.reply_text(
@@ -311,6 +345,7 @@ async def help_cmd(update, context):
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
 give balanced views, and remind lightly that this is not financial advice."""
+
 
 async def free_chat(update, context):
     user_text = update.message.text
