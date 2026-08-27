@@ -36,14 +36,21 @@ GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 MODEL_CHAIN = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest"]
 
+# Plain-text fallback chain — fast/cheap models, no live web search.
 GROQ_MODEL_CHAIN = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
     "qwen/qwen3.6-27b",
-    "groq/compound-mini",
     "allam-2-7b",
 ]
+# Search-needed fallback chain — leads with Groq's Compound systems, which have
+# genuine built-in real-time web search (see console.groq.com/docs/compound).
+# Plain chat models can't search at all, so they're only a last-resort fallback here.
+GROQ_SEARCH_MODEL_CHAIN = [
+    "groq/compound-mini",
+    "groq/compound",
+] + GROQ_MODEL_CHAIN
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_URL = f"{GROQ_BASE}/chat/completions"
 
@@ -58,11 +65,12 @@ def clean_thinking(text):
     return text
 
 
-def ask_groq(prompt):
+def ask_groq(prompt, use_search=False):
     if not GROQ_API_KEY:
         return None
     prompt = "Reply ONLY in English.\n\n" + prompt
-    for gm in GROQ_MODEL_CHAIN:
+    chain = GROQ_SEARCH_MODEL_CHAIN if use_search else GROQ_MODEL_CHAIN
+    for gm in chain:
         try:
             r = requests.post(
                 GROQ_URL,
@@ -86,7 +94,7 @@ def ask_groq(prompt):
 def ask_gemini(prompt, use_search=False):
     if not GEMINI_CLIENT:
         print("⚠️ GEMINI_API_KEY not set, skipping straight to Groq")
-        return ask_groq(prompt)
+        return ask_groq(prompt, use_search=use_search)
     prompt = "Reply ONLY in English.\n\n" + prompt
     config = None
     if use_search:
@@ -108,7 +116,7 @@ def ask_gemini(prompt, use_search=False):
                 continue
             print(f"Gemini {model_name} error: {e}")
             continue
-    return ask_groq(prompt)
+    return ask_groq(prompt, use_search=use_search)
 
 
 def ask_ai_or_softfail(prompt):
