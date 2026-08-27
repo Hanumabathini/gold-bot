@@ -14,67 +14,46 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ============ AI BRAINS: Gemini chain + Groq auto-discovery fallback ============
+# ============ AI BRAINS: Gemini chain + Groq fallback ============
 
 genai.configure(api_key=GEMINI_API_KEY)
 
 MODEL_CHAIN = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+
+# Groq models - verified available for this key (best first)
+GROQ_MODEL_CHAIN = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "qwen/qwen3.6-27b",
+    "groq/compound-mini",
+    "allam-2-7b",
+]
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_URL = f"{GROQ_BASE}/chat/completions"
 
-groq_model_cache = None
-
-
-def get_groq_models():
-    """Ask Groq which models this key can use - normal chat models first."""
-    global groq_model_cache
-    if groq_model_cache is None:
-        try:
-            r = requests.get(
-                f"{GROQ_BASE}/models",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                timeout=15,
-            )
-            all_models = [m["id"] for m in r.json().get("data", [])]
-        except Exception as e:
-            print(f"Groq model discovery failed: {e}")
-            groq_model_cache = []
-            return groq_model_cache
-
-        # Drop non-chat models (audio/tts/guard)
-        all_models = [
-            m for m in all_models
-            if not any(k in m for k in ("whisper", "tts", "guard"))
-        ]
-
-        def rank(m):
-            # reasoning models last, everything else first
-            if any(k in m for k in ("r1", "distill", "reason", "qwq", "thinking")):
-                return (2, m)
-            return (1, m)
-
-        groq_model_cache = sorted(all_models, key=rank)
-        print(f"🦙 Groq chat models: {groq_model_cache[:5]}")
-    return groq_model_cache
+# Build thinking-tags dynamically (survives any copy-paste mangling)
+THINK_OPEN = "<" + "think" + ">"
+THINK_CLOSE = "</" + "think" + ">"
 
 
 def clean_thinking(text):
     """Remove reasoning-model 'thinking' output leakage."""
-    # Removes blocks and any leading unclosed think section
-    text = re.sub(r"|$)", "", text, flags=re.DOTALL)
-    return text.strip()
+    text = re.sub(
+        THINK_OPEN + r".*?" + THINK_CLOSE, "", text, flags=re.DOTALL
+    ).strip()
+    # Unclosed thinking block: if it opens but never closes, cut to last close or drop all
+    if THINK_OPEN in text:
+        text = text.split(THINK_OPEN)[0].strip()
+    return text
 
 
 def ask_groq(prompt):
-    """FREE fallback brain via Groq - auto-picks a working model."""
+    """FREE fallback brain via Groq - tries known-good models in order."""
     if not GROQ_API_KEY:
         return None
     prompt = "Reply ONLY in English.\n\n" + prompt
-    candidates = [
-        m for m in get_groq_models()
-        if not (m.startswith("whisper") or m.startswith("playai"))
-    ]
-    for gm in candidates[:6]:
+    for gm in GROQ_MODEL_CHAIN:
         try:
             r = requests.post(
                 GROQ_URL,
@@ -87,6 +66,7 @@ def ask_groq(prompt):
                 timeout=30,
             )
             if r.status_code == 200:
+                print(f"🦙 Answered via {gm}")
                 return clean_thinking(r.json()["choices"][0]["message"]["content"])
             print(f"Groq {gm} error {r.status_code}: {r.text[:150]}")
         except Exception as e:
@@ -376,7 +356,7 @@ async def free_chat(update, context):
 
 brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY!"
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
-print(f"🧠 Dual-brain: Gemini(3 models) → Groq auto-discovered fallback {brain_status}")
+print(f"🧠 Dual-brain: Gemini(3 models) → Groq hard-coded chain {brain_status}")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
