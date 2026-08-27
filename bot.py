@@ -1,7 +1,10 @@
 import os
 import re
+import json
+import base64
 import threading
 import requests
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 import yfinance as yf
@@ -14,6 +17,8 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TWELVEDATA_KEY = os.getenv("TWELVEDATA_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. Hanumabathini/trading
 
 # ============ AI BRAINS: Gemini chain + Groq fallback ============
 
@@ -21,7 +26,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 MODEL_CHAIN = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-flash-latest"]
 
-# Groq models - verified available for this key (best first)
 GROQ_MODEL_CHAIN = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -33,16 +37,13 @@ GROQ_MODEL_CHAIN = [
 GROQ_BASE = "https://api.groq.com/openai/v1"
 GROQ_URL = f"{GROQ_BASE}/chat/completions"
 
-# Build thinking-tags dynamically (survives any copy-paste mangling)
 THINK_OPEN = "<" + "think" + ">"
 THINK_CLOSE = "</" + "think" + ">"
 
 
 def clean_thinking(text):
     """Remove reasoning-model 'thinking' output leakage."""
-    text = re.sub(
-        THINK_OPEN + r".*?" + THINK_CLOSE, "", text, flags=re.DOTALL
-    ).strip()
+    text = re.sub(THINK_OPEN + r".*?" + THINK_CLOSE, "", text, flags=re.DOTALL).strip()
     if THINK_OPEN in text:
         text = text.split(THINK_OPEN)[0].strip()
     return text
@@ -143,16 +144,15 @@ def get_indicator(indicator, interval="15min"):
     try:
         r = requests.get(
             f"{TD_BASE}/{indicator}",
-            params={
-                "symbol": "XAU/USD",
-                "interval": interval,
-                "apikey": TWELVEDATA_KEY,
-            },
+            params={"symbol": "XAU/USD", "interval": interval, "apikey": TWELVEDATA_KEY},
             timeout=10,
         )
         j = r.json()
-        # Each indicator returns its values under its own name
-        values = j.get("values") or list(j.values())[0].get("values") if isinstance(list(j.values())[0] if j else None, dict) else j.get("values")
+        values = j.get("values")
+        if not values and j:
+            first = list(j.values())[0]
+            if isinstance(first, dict):
+                values = first.get("values")
         return values
     except Exception as e:
         print(f"TwelveData {indicator} failed: {e}")
@@ -176,6 +176,74 @@ def get_technicals_snapshot():
         )
     return "\n".join(parts) if parts else None
 
+# ============ TRADE JOURNAL -> GITHUB (Obsidian bridge) ============
+
+GH_API = "https://api.github.com"
+JOURNAL_DIR = "Journal"          # folder inside the repo
+JOURNAL_FILE = "trades.md"       # single running journal file
+
+
+def gh_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def gh_get_file():
+    """Return (sha, decoded_text). sha=None if file doesn't exist yet."""
+    url = f"{GH_API}/repos/{GITHUB_REPO}/contents/{JOURNAL_DIR}/{JOURNAL_FILE}"
+    r = requests.get(url, headers=gh_headers(), timeout=15)
+    if r.status_code == 200:
+        j = r.json()
+        return j["sha"], base64.b64decode(j["content"]).decode("utf-8")
+    if r.status_code == 404:
+        return None, ""
+    raise Exception(f"GitHub read failed {r.status_code}: {r.text[:150]}")
+
+
+def gh_write_file(new_content, sha):
+    """Create/update the journal file and commit."""
+    url = f"{GH_API}/repos/{GITHUB_REPO}/contents/{JOURNAL_DIR}/{JOURNAL_FILE}"
+    body = {
+        "message": f"📓 journal entry {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+        "committer": {"name": "gold-bot", "email": "bot@users.noreply.github.com"},
+    }
+    if sha:
+        body["sha"] = sha
+    r = requests.put(url, headers=gh_headers(), json=body, timeout=20)
+    if r.status_code not in (200, 201):
+        raise Exception(f"GitHub write failed {r.status_code}: {r.text[:200]}")
+
+
+def add_journal_entry(text):
+    """Append a timestamped note to the journal file. Returns commit message."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    price_line = ""
+    try:
+        price_line = f" | price: ${get_gold_price():,.2f}"
+    except Exception:
+        pass
+
+    entry = f"\n## {now}{price_line}\n{text}\n"
+    sha, content = gh_get_file()
+    if not content:
+        content = "# 📓 Gold Trading Journal\nAuto-updated from Telegram bot.\n"
+    gh_write_file(content + entry, sha)
+    return f"{now}{price_line}"
+
+
+def get_recent_entries(n=5):
+    """Extract the last N '## ' entry headers + their lines."""
+    _, content = gh_get_file()
+    if not content:
+        return None
+    blocks = content.split("\n## ")
+    blocks = [b if b.startswith("## ") else "## " + b for b in blocks if b.strip()]
+    return blocks[-n:] if blocks else None
+
+# ============ TELEGRAM SEND ============
 
 def send_message(text):
     try:
@@ -232,7 +300,9 @@ async def start(update, context):
         "/news - today's gold headlines\n"
         "/calendar - high-impact economic events\n"
         "/live - ask AI anything with REAL-TIME web search\n"
-        "/webhookstatus - check webhook\n"
+        "/note <text> - log to your Obsidian journal 📓\n"
+        "/trades - last 5 journal entries\n"
+        "/summary - AI reviews your recent journal\n"
         "/help - commands\n\n"
         "💬 Or just chat with me about gold!"
     )
@@ -252,8 +322,7 @@ async def indicators_cmd(update, context):
     snap = get_technicals_snapshot()
     if not snap:
         await update.message.reply_text(
-            "⚠️ Indicators need a TWELVEDATA_API_KEY (free at twelvedata.com).\n"
-            "Add it to Render Environment and redeploy!"
+            "⚠️ Indicators need a TWELVEDATA_API_KEY (free at twelvedata.com)."
         )
         return
     current = get_gold_price()
@@ -303,10 +372,9 @@ async def live(update, context):
     )
     await update.message.reply_text(f"🌐 LIVE ANSWER:\n\n{answer}")
 
-# ---------- NEWS COMMAND (Google News RSS) ----------
+# ---------- NEWS COMMAND ----------
 
 def fetch_gold_news():
-    """Today's gold headlines from Google News RSS (free)."""
     url = "https://news.google.com/rss/search?q=gold+price+when:1d&hl=en-US&gl=US&ceid=US:en"
     r = requests.get(url, timeout=10)
     titles = re.findall(r"<title>(.*?)</title>", r.text)[1:8]
@@ -318,17 +386,14 @@ async def news(update, context):
     try:
         headlines = fetch_gold_news()
         news_text = "\n".join(f"• {h}" for h in headlines)
-
         prompt = (
             f"Today's gold headlines:\n{news_text}\n\n"
             "Under 150 words: today's key theme for gold traders. "
             "Use emojis. End with 'Not financial advice.'"
         )
         summary = ask_gemini(prompt)
-
         await update.message.reply_text(
-            f"📰 TODAY'S GOLD HEADLINES:\n\n{news_text}\n\n"
-            f"🧠 AI TAKE:\n\n{summary}"
+            f"📰 TODAY'S GOLD HEADLINES:\n\n{news_text}\n\n🧠 AI TAKE:\n\n{summary}"
         )
     except Exception as e:
         await update.message.reply_text(f"📰 RSS failed ({e}). Trying live search...")
@@ -338,10 +403,9 @@ async def news(update, context):
         )
         await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}")
 
-# ---------- ECONOMIC CALENDAR (ForexFactory + safe fallback) ----------
+# ---------- ECONOMIC CALENDAR ----------
 
 def fetch_ff_events():
-    """ForexFactory weekly calendar - high-impact only."""
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -350,8 +414,6 @@ def fetch_ff_events():
     }
     r = requests.get(url, headers=headers, timeout=15)
     events = r.json()
-
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     out = []
     for ev in events:
@@ -383,34 +445,95 @@ async def calendar(update, context):
         await update.message.reply_text("✅ No more high-impact events this week!")
         return
     event_list = "\n".join(events)
-
     prompt = (
         f"Upcoming HIGH-impact economic events:\n{event_list}\n\n"
         "In under 120 words: which of these matter MOST for gold and why. "
         "Use emojis. Not financial advice."
     )
     take = ask_gemini(prompt)
-
     await update.message.reply_text(
         f"📅 UPCOMING HIGH-IMPACT NEWS (ForexFactory):\n\n{event_list}\n\n🧠 GOLD IMPACT:\n\n{take}"
     )
+
+# ---------- JOURNAL COMMANDS ----------
+
+async def note(update, context):
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "📓 Usage: /note LONG 4650 SL 4630 TP 4700 - breakout retest\n"
+            "Anything you write is saved to your GitHub journal (appears in Obsidian)!"
+        )
+        return
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        await update.message.reply_text(
+            "⚠️ Journal needs GITHUB_TOKEN + GITHUB_REPO in environment!"
+        )
+        return
+    await update.message.reply_text("📓 Saving to journal...")
+    try:
+        stamp = add_journal_entry(text)
+        await update.message.reply_text(
+            f"✅ Saved to Journal/trades.md!\n\n🕒 {stamp}\n📝 {text}\n\n"
+            "→ It's committed to GitHub now. Pull in Obsidian to see it! 🎉"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Journal save failed: {e}")
+
+
+async def trades(update, context):
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        await update.message.reply_text("⚠️ Journal not configured (GITHUB_TOKEN/GITHUB_REPO).")
+        return
+    try:
+        blocks = get_recent_entries(5)
+        if not blocks:
+            await update.message.reply_text("📓 Journal is empty! Add your first /note 📝")
+            return
+        await update.message.reply_text(
+            "📓 LAST 5 JOURNAL ENTRIES:\n" + "\n\n".join(blocks)
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Couldn't read journal: {e}")
+
+
+async def summary(update, context):
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        await update.message.reply_text("⚠️ Journal not configured (GITHUB_TOKEN/GITHUB_REPO).")
+        return
+    await update.message.reply_text("🧠 Reading your journal...")
+    try:
+        blocks = get_recent_entries(10)
+        if not blocks:
+            await update.message.reply_text("📓 Journal is empty - nothing to summarize yet!")
+            return
+        journal_text = "\n\n".join(blocks)
+        take = ask_gemini(
+            f"A trader's recent gold trade journal:\n{journal_text}\n\n"
+            "In under 150 words: patterns in their entries (biases, repeated setups, "
+            "risk habits), one piece of constructive advice. Use emojis. "
+            "Not financial advice."
+        )
+        await update.message.reply_text(f"🧠 JOURNAL REVIEW:\n\n{take}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Summary failed: {e}")
 
 
 async def webhookstatus(update, context):
     await update.message.reply_text(
         "🔗 Webhook server runs on port 5000.\n"
-        "TradingView signals arrive instantly when everything is running!\n"
-        "Webhook URL for TradingView: https://YOUR-RENDER-APP.onrender.com/webhook"
+        "TradingView alerts POST to: https://YOUR-RENDER-APP.onrender.com/webhook"
     )
 
 
 async def help_cmd(update, context):
     await update.message.reply_text(
-        "Commands: /start /price /analyze /indicators /news /calendar /live /webhookstatus /help\n\n"
+        "Commands: /start /price /analyze /indicators /news /calendar /live "
+        "/note /trades /summary /webhookstatus /help\n\n"
         "💬 Or type any question normally!"
     )
 
-# ============ FREE CHAT (Groq FIRST to save Gemini quota!) ============
+# ============ FREE CHAT ============
 
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
@@ -443,10 +566,12 @@ async def free_chat(update, context):
 # ============ RUN EVERYTHING ============
 
 brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY!"
-td_status = "✅" if TWELVEDATA_KEY else "⚠️ Yahoo-only (add TWELVEDATA_API_KEY)"
+td_status = "✅" if TWELVEDATA_KEY else "⚠️ Yahoo-only"
+gh_status = "✅" if (GITHUB_TOKEN and GITHUB_REPO) else "⚠️ journal off"
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
-print(f"🧠 Dual-brain: Gemini(3 models) → Groq hard-coded chain {brain_status}")
-print(f"📡 Market data: TwelveData → Yahoo fallback {td_status}")
+print(f"🧠 Dual-brain: Gemini(3 models) → Groq chain {brain_status}")
+print(f"📡 Market data: TwelveData → Yahoo {td_status}")
+print(f"📓 Journal → GitHub/{JOURNAL_DIR}: {gh_status}")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
@@ -458,6 +583,9 @@ app.add_handler(CommandHandler("indicators", indicators_cmd))
 app.add_handler(CommandHandler("news", news))
 app.add_handler(CommandHandler("calendar", calendar))
 app.add_handler(CommandHandler("live", live))
+app.add_handler(CommandHandler("note", note))
+app.add_handler(CommandHandler("trades", trades))
+app.add_handler(CommandHandler("summary", summary))
 app.add_handler(CommandHandler("webhookstatus", webhookstatus))
 app.add_handler(CommandHandler("help", help_cmd))
 
