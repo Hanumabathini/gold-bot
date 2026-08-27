@@ -14,36 +14,60 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ================= AI BRAINS: Gemini chain + Groq fallback =================
+# ================= AI BRAINS: Gemini chain + Groq auto-discovery fallback =================
 
 genai.configure(api_key=GEMINI_API_KEY)
 
 MODEL_CHAIN = ["gemini-3.7-flash", "gemini-2.0-flash", "gemini-flash-latest"]
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_BASE = "https://api.groq.com/openai/v1"
+GROQ_URL = f"{GROQ_BASE}/chat/completions"
+
+groq_model_cache = None  # discovered once at runtime
+
+def get_groq_models():
+    """Ask Groq which models this key can actually use - pick best chat ones."""
+    global groq_model_cache
+    if groq_model_cache is None:
+        try:
+            r = requests.get(
+                f"{GROQ_BASE}/models",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                timeout=15,
+            )
+            all_models = [m["id"] for m in r.json().get("data", [])]
+            # Keep only chat models (drop audio/tts/guard models)
+            groq_model_cache = [
+                m for m in all_models
+                if "whisper" not in m and "tts" not in m and "guard" not in m
+            ]
+            print(f"🦙 Groq models available: {groq_model_cache[:5]}")
+        except Exception as e:
+            print(f"Groq model discovery failed: {e}")
+            groq_model_cache = []
+    return groq_model_cache
 
 def ask_groq(prompt):
-    """FREE fallback brain via Groq (Llama 3.3 70B)."""
+    """FREE fallback brain via Groq - auto-picks a working model."""
     if not GROQ_API_KEY:
         return None
-    try:
-        r = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 500,
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"]
-        print(f"Groq error {r.status_code}: {r.text[:150]}")
-        return None
-    except Exception as e:
-        print(f"Groq failed: {e}")
-        return None
+    for gm in get_groq_models()[:5]:
+        try:
+            r = requests.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": gm,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 500,
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+            print(f"Groq {gm} error {r.status_code}: {r.text[:150]}")
+        except Exception as e:
+            print(f"Groq {gm} failed: {e}")
+    return None
 
 def ask_gemini(prompt, tools=None):
     """Try Gemini models in order (skips out-of-quota), then Groq."""
@@ -117,7 +141,7 @@ def webhook():
         f"{signal_type} entry. Start with AGREE or DISAGREE. Not financial advice."
     )
     opinion = ask_gemini(prompt)
-    send_message(f"🧠 GEMINI'S OPINION:\n\n{opinion}")
+    send_message(f"🧠 AI OPINION:\n\n{opinion}")
 
     return jsonify({"status": "ok"}), 200
 
@@ -210,7 +234,6 @@ async def news(update, context):
             f"🧠 AI TAKE:\n\n{summary}"
         )
     except Exception as e:
-        # Even if RSS fails, still give a live-search answer
         answer = ask_live("Summarize today's gold market news in under 150 words. Use emojis. Not financial advice.")
         await update.message.reply_text(f"📰 NEWS (via live search):\n\n{answer}\n\n(rss error: {e})")
 
@@ -283,7 +306,7 @@ async def help_cmd(update, context):
         "💬 Or type any question normally!"
     )
 
-# ================= FREE CHAT (routes to cheapest available brain!) =================
+# ================= FREE CHAT (Groq FIRST to save Gemini quota!) =================
 
 GOLD_CONTEXT = """You are a friendly gold trading assistant chatting on Telegram.
 You help analyze XAU/USD (gold). Be concise (under 150 words), use emojis,
@@ -309,9 +332,9 @@ async def free_chat(update, context):
 
 # ================= RUN EVERYTHING =================
 
-brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY to .env"
+brain_status = "✅" if GROQ_API_KEY else "⚠️ add GROQ_API_KEY!"
 print("🤖 Starting bot + webhook server (port 5000)... press Ctrl+C to stop")
-print(f"🧠 Dual-brain: Gemini(3 models) → Groq fallback {brain_status}")
+print(f"🧠 Dual-brain: Gemini(3 models) → Groq auto-discovered fallback {brain_status}")
 
 threading.Thread(target=run_flask, daemon=True).start()
 
