@@ -5,7 +5,6 @@ import json
 import base64
 import threading
 import time
-import statistics
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -26,6 +25,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TWELVEDATA_KEY = os.getenv("TWELVEDATA_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. Hanumabathini/gold-bot
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # optional but recommended — see /webhook below
 
 BRIEFING_HOUR_UTC = int(os.getenv("BRIEFING_HOUR_UTC", "2"))
 ALERT_CHECK_SECONDS = 300
@@ -89,7 +89,10 @@ def ask_groq(prompt, use_search=False):
                 json={
                     "model": gm,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 500,
+                    # compound/compound-mini spend part of this budget on the tool
+                    # call itself before writing the answer — 500 risked truncating
+                    # search replies, so search calls get more headroom.
+                    "max_tokens": 900 if use_search else 500,
                 },
                 timeout=30,
             )
@@ -201,6 +204,115 @@ def get_technicals_snapshot():
             f"MACD 15min: macd={m.get('macd','n/a')} signal={m.get('signal','n/a')} hist={m.get('hist','n/a')}"
         )
     return "\n".join(parts) if parts else None
+
+
+MTF_INTERVALS = ["15min", "1h", "4h", "1day"]
+
+
+def get_mtf_snapshot():
+    """RSI + EMA20 across several timeframes (kept lean — 2 TwelveData calls per
+    timeframe — since the free TwelveData tier has a tight per-minute credit cap)."""
+    lines = []
+    for interval in MTF_INTERVALS:
+        rsi = get_indicator("rsi", interval)
+        ema20 = get_indicator("ema", interval)
+        parts = []
+        if rsi:
+            parts.append(f"RSI {rsi[0].get('rsi', 'n/a')}")
+        if ema20:
+            parts.append(f"EMA20 {ema20[0].get('ema', 'n/a')}")
+        if parts:
+            lines.append(f"{interval}: " + " | ".join(parts))
+    return "\n".join(lines) if lines else None
+
+
+def get_correlation_context():
+    """Gold vs. DXY (dollar index) and the 10Y Treasury yield — gold's two most-watched
+    macro correlations. Both driven off yfinance, no extra API key needed."""
+    try:
+        gold = yf.Ticker("GC=F").history(period="5d")
+        dxy = yf.Ticker("DX-Y.NYB").history(period="5d")
+        tnx = yf.Ticker("^TNX").history(period="5d")
+    except Exception as e:
+        print(f"Correlation fetch failed: {e}")
+        return None
+    if gold is None or gold.empty:
+        return None
+
+    def pct_change(df):
+        if df is None or len(df) < 2:
+            return None
+        prev, last = df["Close"].iloc[-2], df["Close"].iloc[-1]
+        return (last - prev) / prev * 100
+
+    gold_chg = pct_change(gold)
+    dxy_chg = pct_change(dxy)
+    tnx_chg = pct_change(tnx)
+
+    lines = []
+    if gold_chg is not None:
+        lines.append(f"🥇 Gold: {gold_chg:+.2f}% (1D)")
+    if dxy_chg is not None:
+        lines.append(f"💵 DXY (Dollar Index): {dxy_chg:+.2f}% (1D)")
+    if tnx is not None and not tnx.empty and tnx_chg is not None:
+        # ^TNX is quoted directly as the yield in percent (e.g. 4.66 = 4.66%), not scaled.
+        yield_now = tnx["Close"].iloc[-1]
+        lines.append(f"📈 10Y Treasury yield: {yield_now:.2f}% ({tnx_chg:+.2f}% 1D)")
+
+    relationship = ""
+    if dxy_chg is not None and gold_chg is not None:
+        if abs(gold_chg) < 0.05 or abs(dxy_chg) < 0.05:
+            relationship = "➖ Both roughly flat today — no clear correlation signal."
+        elif (gold_chg > 0) != (dxy_chg > 0):
+            relationship = "✅ Gold and DXY moving opposite directions — the usual inverse relationship is holding."
+        else:
+            relationship = "⚠️ Gold and DXY moving the SAME direction today — a divergence from their typical inverse relationship, worth noting."
+
+    if not lines:
+        return None
+    return "\n".join(lines), relationship
+
+
+def run_ema_vwap_backtest(period="5d", interval="15m", ema_span=9):
+    """Long-only EMA9/VWAP crossover backtest. VWAP needs real trade volume, which is
+    why this uses GC=F futures bars (COMEX volume via Yahoo) rather than a spot XAU/USD
+    feed — spot forex-style gold quotes generally carry no genuine volume at all.
+    Returns (trades, error_message) — trades is a list of % returns, one per closed trade."""
+    data = yf.Ticker("GC=F").history(period=period, interval=interval)
+    if data is None or len(data) < ema_span + 10:
+        return None, "Not enough intraday data for that interval/period."
+    if "Volume" not in data.columns or data["Volume"].sum() == 0:
+        return None, "No volume data available on this interval — VWAP needs real volume. Try a different interval (e.g. 15m, 30m, 1h)."
+
+    data = data.copy()
+    data["typical"] = (data["High"] + data["Low"] + data["Close"]) / 3
+    session = data.index.date
+    tp_vol = data["typical"] * data["Volume"]
+    cum_tp_vol = tp_vol.groupby(session).cumsum()
+    cum_vol = data["Volume"].groupby(session).cumsum()
+    data["vwap"] = cum_tp_vol / cum_vol
+    data["ema9"] = data["Close"].ewm(span=ema_span, adjust=False).mean()
+    data = data.dropna(subset=["vwap", "ema9"])
+    if len(data) < 5:
+        return None, "Not enough valid bars after VWAP/EMA warmup — try a longer period."
+
+    position = 0  # 0 = flat, 1 = long
+    entry_price = 0.0
+    trades = []
+    for i in range(1, len(data)):
+        prev_ema, prev_vwap = data["ema9"].iloc[i - 1], data["vwap"].iloc[i - 1]
+        cur_ema, cur_vwap = data["ema9"].iloc[i], data["vwap"].iloc[i]
+        price = data["Close"].iloc[i]
+        if position == 0 and prev_ema <= prev_vwap and cur_ema > cur_vwap:
+            position = 1
+            entry_price = price
+        elif position == 1 and prev_ema >= prev_vwap and cur_ema < cur_vwap:
+            position = 0
+            trades.append((price - entry_price) / entry_price * 100)
+    if position == 1:
+        trades.append((data["Close"].iloc[-1] - entry_price) / entry_price * 100)
+
+    return trades, None
 
 # ============ CHART IMAGE ============
 
@@ -559,18 +671,47 @@ def get_events_resilient():
     except Exception:
         pass
 
+    today = datetime.now(timezone.utc)
     ai = ask_gemini(
-        "Search the web: list the upcoming HIGH-impact economic events in the next 3 days "
-        "(US and EU mainly) that matter for gold. Format each line exactly as: "
-        "🔴 Day HH:MM UTC | COUNTRY | Event name. Max 10 lines, no other text.",
+        f"Today's real date is {today.strftime('%A, %d %B %Y')} (UTC). Search the web right "
+        f"now — do not rely on memory or cached knowledge — and list the upcoming HIGH-impact "
+        f"economic events in the next 3 days (US and EU mainly) that matter for gold. Every "
+        f"event MUST be on or after {today.strftime('%d %b %Y')}; do not include anything from "
+        f"a past week or month. Format each line exactly as: "
+        f"🔴 DD Mon HH:MM UTC | COUNTRY | Event name (e.g. 🔴 28 Aug 12:30 UTC | US | CPI YoY) "
+        f"— always include the actual day-of-month and month abbreviation, never just a weekday "
+        f"name like 'Mon' or 'Tue' alone. Max 10 lines, no other text.",
         use_search=True,
     )
     if ai:
-        lines = [l.strip() for l in ai.split("\n") if l.strip().startswith("🔴")]
+        raw_lines = [l.strip() for l in ai.split("\n") if l.strip().startswith("🔴")]
+        lines = [l for l in raw_lines if _calendar_line_is_current(l, today)]
         if lines:
             return lines[:12], "AI web search"
+        if raw_lines:
+            print(f"AI calendar search returned only stale/unparseable lines: {raw_lines}")
 
     raise Exception("All calendar sources failed")
+
+
+def _calendar_line_is_current(line, today, past_grace_days=1, future_window_days=10):
+    """Guards against a stale/hallucinated AI search result slipping through — parses the
+    'DD Mon' date out of a 🔴-formatted calendar line and drops it if it's not roughly
+    today..+future_window_days. A line with no parseable date is dropped too, since that's
+    exactly the shape of the bug this is guarding against (bare 'Mon'/'Tue' with no real date)."""
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3})", line)
+    if not m:
+        return False
+    day, mon_abbr = int(m.group(1)), m.group(2)[:3].title()
+    for year_guess in (today.year, today.year + 1):
+        try:
+            candidate = datetime.strptime(f"{day} {mon_abbr} {year_guess}", "%d %b %Y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        delta_days = (candidate.date() - today.date()).days
+        if -past_grace_days <= delta_days <= future_window_days:
+            return True
+    return False
 
 # ============ FLASK WEBHOOK ============
 
@@ -580,6 +721,11 @@ flask_app = Flask(__name__)
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
+    # Anyone who finds this URL can otherwise fire fake signals into your chat.
+    # Set WEBHOOK_SECRET in your environment and include {"secret": "..."} in the
+    # TradingView alert JSON body to lock this down. Unset = no check (back-compat).
+    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"status": "unauthorized"}), 401
     signal_type = data.get("signal", "SIGNAL").upper()
     tv_message = data.get("message", "TradingView alert")
 
@@ -619,6 +765,10 @@ async def start(update, context):
         "/chart - candlestick chart photo 📸\n"
         "/analyze - AI analysis with REAL indicators\n"
         "/indicators - RSI / EMA / MACD snapshot\n"
+        "/mtf - multi-timeframe technicals (15m/1h/4h/1D)\n"
+        "/correlation - gold vs DXY & 10Y yield 🔗\n"
+        "/backtest <fast> <slow> [period] - SMA crossover backtest 🧪\n"
+        "/backtestvwap [interval] [period] - EMA9/VWAP crossover backtest 🧪\n"
         "/alert <price> - price alert (e.g. /alert 4700)\n"
         "/alerts - list active alerts\n"
         "/risk <account> <risk%> <entry> <stop> - position size 🧮\n"
@@ -679,6 +829,169 @@ async def indicators_cmd(update, context):
         "momentum? Bullish/bearish/neutral and why. Use emojis. Not financial advice."
     )
     await update.message.reply_text(f"📊 REAL TECHNICALS (15min):\n\n{snap}\n\n🧠 AI READ:\n\n{take}")
+
+
+async def mtf(update, context):
+    await update.message.reply_text("📊 Pulling multi-timeframe technicals (15m/1h/4h/1D)...")
+    snap = get_mtf_snapshot()
+    if not snap:
+        await update.message.reply_text(
+            "⚠️ Multi-timeframe technicals need a TWELVEDATA_API_KEY (free at twelvedata.com)."
+        )
+        return
+    current = get_gold_price()
+    take = ask_ai_or_softfail(
+        f"Current gold price: ${current}\nMulti-timeframe RSI/EMA readings:\n{snap}\n\n"
+        "In under 130 words: is the trend aligned across timeframes, or is a shorter "
+        "timeframe diverging from the bigger picture (e.g. bullish 1h but bearish daily)? "
+        "Give an overall bullish/bearish/neutral read. Use emojis. Not financial advice."
+    )
+    await update.message.reply_text(
+        f"📊 MULTI-TIMEFRAME TECHNICALS:\n\n{snap}\n\n🧠 AI READ:\n\n{take}"
+    )
+
+
+async def correlation(update, context):
+    await update.message.reply_text("🔗 Pulling gold/DXY/yields correlation context...")
+    result = get_correlation_context()
+    if not result:
+        await update.message.reply_text("❌ Couldn't fetch correlation data right now — try again shortly.")
+        return
+    lines, relationship = result
+    take = ask_ai_or_softfail(
+        f"Gold correlation snapshot:\n{lines}\n{relationship}\n\n"
+        "In under 100 words: what does this dollar/yield relationship suggest for gold's "
+        "near-term bias? Use emojis. Not financial advice."
+    )
+    await update.message.reply_text(
+        f"🔗 GOLD CORRELATION CHECK:\n\n{lines}\n{relationship}\n\n🧠 AI READ:\n\n{take}"
+    )
+
+
+async def backtest(update, context):
+    args = context.args
+    fast, slow, period = 20, 50, "1y"
+    if len(args) >= 1:
+        try:
+            fast = int(args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Usage: /backtest <fast_sma> <slow_sma> [period]\nExample: /backtest 20 50 1y"
+            )
+            return
+    if len(args) >= 2:
+        try:
+            slow = int(args[1])
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Usage: /backtest <fast_sma> <slow_sma> [period]\nExample: /backtest 20 50 1y"
+            )
+            return
+    if len(args) >= 3:
+        period = args[2]
+    if fast >= slow:
+        await update.message.reply_text("❌ Fast SMA must be shorter than slow SMA!")
+        return
+
+    await update.message.reply_text(
+        f"🧪 Backtesting {fast}/{slow} SMA crossover on {period} of daily gold data..."
+    )
+    try:
+        data = yf.Ticker("GC=F").history(period=period, interval="1d")
+        if len(data) < slow + 5:
+            await update.message.reply_text(
+                "❌ Not enough historical data for that SMA window/period — try a shorter "
+                "SMA or a longer period."
+            )
+            return
+
+        data["fast_sma"] = data["Close"].rolling(fast).mean()
+        data["slow_sma"] = data["Close"].rolling(slow).mean()
+        data = data.dropna()
+
+        position = 0  # 0 = flat, 1 = long
+        entry_price = 0.0
+        trades = []
+        for i in range(1, len(data)):
+            prev_fast, prev_slow = data["fast_sma"].iloc[i - 1], data["slow_sma"].iloc[i - 1]
+            cur_fast, cur_slow = data["fast_sma"].iloc[i], data["slow_sma"].iloc[i]
+            price = data["Close"].iloc[i]
+            if position == 0 and prev_fast <= prev_slow and cur_fast > cur_slow:
+                position = 1
+                entry_price = price
+            elif position == 1 and prev_fast >= prev_slow and cur_fast < cur_slow:
+                position = 0
+                trades.append((price - entry_price) / entry_price * 100)
+        if position == 1:
+            trades.append((data["Close"].iloc[-1] - entry_price) / entry_price * 100)
+
+        if not trades:
+            await update.message.reply_text(
+                f"📊 {fast}/{slow} SMA crossover produced 0 completed signals in {period} "
+                "of data. Try a different window or a longer period."
+            )
+            return
+
+        wins = [t for t in trades if t > 0]
+        win_rate = len(wins) / len(trades) * 100
+        total_return = sum(trades)  # additive %, not compounded — see disclaimer below
+        avg_trade = total_return / len(trades)
+        best, worst = max(trades), min(trades)
+
+        await update.message.reply_text(
+            f"🧪 BACKTEST: {fast}/{slow} SMA crossover on GC=F ({period}, daily)\n\n"
+            f"🔢 Trades: {len(trades)}\n"
+            f"🏆 Win rate: {win_rate:.0f}%\n"
+            f"💰 Total return (additive %): {total_return:+.2f}%\n"
+            f"📊 Avg trade: {avg_trade:+.2f}%\n"
+            f"⭐ Best: {best:+.2f}% | 💀 Worst: {worst:+.2f}%\n\n"
+            "⚠️ Simplified backtest: no slippage, fees, or spread modeled; returns are "
+            "additive, not compounded; long-only. Informational only, not a strategy "
+            "recommendation, and past performance ≠ future results."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Backtest failed: {e}")
+
+
+async def backtestvwap(update, context):
+    args = context.args
+    interval = args[0] if len(args) >= 1 else "15m"
+    period = args[1] if len(args) >= 2 else "5d"
+
+    await update.message.reply_text(
+        f"🧪 Backtesting EMA9 / VWAP crossover on {interval} gold bars ({period})..."
+    )
+    try:
+        trades, err = run_ema_vwap_backtest(period=period, interval=interval)
+        if err:
+            await update.message.reply_text(f"❌ {err}")
+            return
+        if not trades:
+            await update.message.reply_text(
+                f"📊 EMA9/VWAP crossover produced 0 completed signals on {interval} bars "
+                f"over {period}. Try a different interval or a longer period."
+            )
+            return
+
+        wins = [t for t in trades if t > 0]
+        win_rate = len(wins) / len(trades) * 100
+        total_return = sum(trades)
+        avg_trade = total_return / len(trades)
+        best, worst = max(trades), min(trades)
+
+        await update.message.reply_text(
+            f"🧪 BACKTEST: EMA9 / VWAP crossover on GC=F ({interval} bars, {period})\n\n"
+            f"🔢 Trades: {len(trades)}\n"
+            f"🏆 Win rate: {win_rate:.0f}%\n"
+            f"💰 Total return (additive %): {total_return:+.2f}%\n"
+            f"📊 Avg trade: {avg_trade:+.2f}%\n"
+            f"⭐ Best: {best:+.2f}% | 💀 Worst: {worst:+.2f}%\n\n"
+            "⚠️ VWAP resets every session, which can trigger a signal right at the open; "
+            "no slippage/fees modeled; returns are additive, not compounded; long-only. "
+            "Informational only, not a strategy recommendation."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Backtest failed: {e}")
 
 
 async def analyze(update, context):
@@ -1013,8 +1326,8 @@ async def summary(update, context):
 
 async def help_cmd(update, context):
     await update.message.reply_text(
-        "Commands: /start /price /chart /analyze /indicators /alert /alerts /risk "
-        "/note /close /stats /trades /summary /news /calendar /live /help\n\n"
+        "Commands: /start /price /chart /analyze /indicators /mtf /correlation /backtest /backtestvwap "
+        "/alert /alerts /risk /note /close /stats /trades /summary /news /calendar /live /help\n\n"
         "💬 Or type any question normally!"
     )
 
@@ -1069,6 +1382,10 @@ app.add_handler(CommandHandler("price", price))
 app.add_handler(CommandHandler("chart", chart))
 app.add_handler(CommandHandler("analyze", analyze))
 app.add_handler(CommandHandler("indicators", indicators_cmd))
+app.add_handler(CommandHandler("mtf", mtf))
+app.add_handler(CommandHandler("correlation", correlation))
+app.add_handler(CommandHandler("backtest", backtest))
+app.add_handler(CommandHandler("backtestvwap", backtestvwap))
 app.add_handler(CommandHandler("alert", alert_cmd))
 app.add_handler(CommandHandler("alerts", alerts_list))
 app.add_handler(CommandHandler("risk", risk))
